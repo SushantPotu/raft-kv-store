@@ -1,0 +1,50 @@
+# Integration Checkpoint 1 target: a static 3-node, single-shard Raft
+# cluster. Peer addresses are the compose service DNS names — no service
+# discovery needed at this stage (that's Workstream I, once we're on AWS).
+# `docker compose config` should validate today; `docker compose up` will
+# work once cmd/kvnode exists (Checkpoint 1).
+name: raft-kv-store
+
+services:
+  kvnode-1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-1
+    environment:
+      - NODE_ID=kvnode-1
+      - SHARD_ID=shard-1
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+    ports:
+      - "9001:9001" # client-facing KV gRPC
+    networks: [raftnet]
+
+  kvnode-2:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-2
+    environment:
+      - NODE_ID=kvnode-2
+      - SHARD_ID=shard-1
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+    ports:
+      - "9002:9001"
+    networks: [raftnet]
+
+  kvnode-3:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-3
+    environment:
+      - NODE_ID=kvnode-3
+      - SHARD_ID=shard-1
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+    ports:
+      - "9003:9001"
+    networks: [raftnet]
+
+networks:
+  raftnet:
+    driver: bridge

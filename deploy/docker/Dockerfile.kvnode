@@ -1,0 +1,15 @@
+# Placeholder until Checkpoint 1 lands cmd/kvnode/main.go (Storage Engine +
+# Raft Core + Client/API workstreams wired together). Structurally correct
+# multi-stage build so `docker build` "just works" the moment that binary
+# exists — nothing here should need to change at that point.
+FROM golang:1.23 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/kvnode ./cmd/kvnode
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/kvnode /kvnode
+EXPOSE 9000 9001
+ENTRYPOINT ["/kvnode"]

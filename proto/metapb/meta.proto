@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package meta.v1;
+
+option go_package = "github.com/SushantPotu/raft-kv-store/pkg/metapb;metapb";
+
+// MetadataService is the cluster's source of truth for "which shard owns
+// this key, and who is its current leader". Backed by DynamoDB in
+// production (see internal/metaservice). kvrouter treats this as the
+// authoritative source and its own in-memory leader-hint cache as a
+// self-healing optimization on top — never the other way around.
+service MetadataService {
+  rpc GetShardForKey(GetShardForKeyRequest) returns (GetShardForKeyResponse);
+  rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+  // Called by a kvnode when it becomes (or stops being) leader for a shard,
+  // so metaservice's record stays close to real-time. Uses a
+  // conditional write keyed on term so a stale/delayed report from an
+  // old leader can never clobber a newer leader's record.
+  rpc ReportLeaderChange(ReportLeaderChangeRequest) returns (ReportLeaderChangeResponse);
+  // Called by a kvnode at startup to register itself as a replica for a
+  // shard (used alongside Cloud Map service discovery for reachability).
+  rpc RegisterReplica(RegisterReplicaRequest) returns (RegisterReplicaResponse);
+}
+
+message ShardDescriptor {
+  string shard_id = 1;
+  bytes key_range_start = 2; // inclusive
+  bytes key_range_end = 3;   // exclusive; empty means "no upper bound"
+  repeated ReplicaDescriptor replicas = 4;
+  string current_leader_node_id = 5;
+  uint64 current_leader_term = 6;
+}
+
+message ReplicaDescriptor {
+  string node_id = 1;
+  string address = 2; // host:port, resolved via service discovery
+  string availability_zone = 3;
+}
+
+message GetShardForKeyRequest {
+  bytes key = 1;
+}
+
+message GetShardForKeyResponse {
+  ShardDescriptor shard = 1;
+}
+
+message ListShardsRequest {}
+
+message ListShardsResponse {
+  repeated ShardDescriptor shards = 1;
+}
+
+message ReportLeaderChangeRequest {
+  string shard_id = 1;
+  string new_leader_node_id = 2;
+  uint64 term = 3;
+}
+
+message ReportLeaderChangeResponse {
+  // False if this report was rejected because a newer term is already
+  // recorded (conditional-write guard against stale reports).
+  bool accepted = 1;
+  uint64 current_term_on_record = 2;
+}
+
+message RegisterReplicaRequest {
+  string shard_id = 1;
+  ReplicaDescriptor replica = 2;
+}
+
+message RegisterReplicaResponse {}

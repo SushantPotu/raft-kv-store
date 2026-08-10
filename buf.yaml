@@ -1,0 +1,16 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Proto files live under proto/<goPkgName>/ (raftpb, kvpb, metapb) so that
+    # `paths=source_relative` codegen lands directly in pkg/<goPkgName>/,
+    # matching the Go package layout the interfaces are written against.
+    # That deliberately doesn't mirror the proto package path (raft.v1 ->
+    # raft/v1), which is what this rule checks for.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE
