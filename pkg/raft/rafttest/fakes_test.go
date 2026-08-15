@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/SushantPotu/raft-kv-store/pkg/raft"
+	"github.com/SushantPotu/raft-kv-store/pkg/raftpb"
 )
 
 func TestFakeStorageAppendAndEntries(t *testing.T) {
@@ -118,9 +119,10 @@ func TestFakeTransportRoutesToRegisteredNode(t *testing.T) {
 	received := make(chan struct{}, 1)
 	reg.Register("b", &recordingNode{onStep: func() { received <- struct{}{} }})
 
-	tr := NewFakeTransport(reg)
-	if _, err := tr.SendAppendEntries(context.Background(), "shard-1", "b", nil); err != nil {
-		t.Fatalf("SendAppendEntries: %v", err)
+	tr := NewFakeTransport("a", reg)
+	msg := raft.Message{To: "b", Shard: "shard-1", Kind: raft.MsgAppendEntries, Payload: &raftpb.AppendEntriesRequest{}}
+	if err := tr.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
 
 	select {

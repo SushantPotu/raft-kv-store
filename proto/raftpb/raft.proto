@@ -4,17 +4,70 @@ package raft.v1;
 
 option go_package = "github.com/SushantPotu/raft-kv-store/pkg/raftpb;raftpb";
 
-// RaftTransport carries peer-to-peer consensus RPCs between nodes hosting
-// the same shard's Raft group. Every RPC carries shard_id so a single
-// transport/connection can multiplex messages for many independently
-// managed Raft groups (Multi-Raft) — this is the seam between a
-// single-shard deployment and a sharded one; the wire protocol does not
-// change between them.
+// RaftTransportService carries peer-to-peer consensus RPCs between nodes
+// hosting the same shard's Raft group.
+//
+// Design note (added at Integration Checkpoint 1, after the original
+// per-RPC-type design — RequestVote/AppendEntries each a unary call
+// synchronously returning their own Response type — turned out not to
+// match how raft.Node actually behaves): Node never produces a reply
+// synchronously from Step. A reply to an inbound RequestVote or
+// AppendEntries is just another outbound raft.Message — carrying a
+// Response-typed payload, addressed back to the original sender — queued
+// for a *later* Ready() call, exactly like any other message (see
+// pkg/raft/types.go's Message/InboundMessage doc comments, and
+// internal/raft/election.go / replication.go, which both call n.send(from,
+// kind, &raftpb.XxxResponse{...}) to reply). A synchronous unary RPC
+// shaped "send a request, get a response back on the same call" cannot
+// carry that: the real response doesn't exist yet when the request
+// arrives, and by the time it does exist, it needs to travel as its own
+// outbound send back to the original requester — not as this call's
+// return value.
+//
+// So every Raft protocol message (request or response, either direction)
+// travels through the single Send RPC below as a RaftMessage envelope,
+// fire-and-forget (returns Empty; the real reply, if any, arrives later as
+// its own separate Send call in the other direction and is fed into the
+// receiver's own Node via Step, same as everything else). This matches
+// Node's actual internal model exactly, and is the same shape etcd/raft's
+// own transport (rafthttp) uses: peers just POST raftpb.Message envelopes
+// at each other.
 service RaftTransportService {
-  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
-  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-  // Streamed because snapshots can be large (full keyspace dump for a shard).
-  rpc InstallSnapshot(stream InstallSnapshotRequest) returns (InstallSnapshotResponse);
+  rpc Send(RaftMessage) returns (SendAck);
+
+  // InstallSnapshot is kept as its own client-streaming RPC (unlike Send
+  // above) because a full-keyspace snapshot can be too large for one
+  // message and needs to be chunked. This call's own synchronous
+  // completion is NOT the real InstallSnapshotResponse — Node produces
+  // that the same asynchronous way as every other reply, delivered back
+  // via a later Send call — callers must not rely on this RPC's return
+  // value for anything beyond "every chunk was received by the transport."
+  rpc InstallSnapshot(stream InstallSnapshotChunk) returns (InstallSnapshotAck);
+}
+
+// SendAck and InstallSnapshotAck are deliberately separate, content-free
+// types (rather than one shared Empty) even though neither carries any
+// data — a shared type used as the response for two different RPCs is a
+// buf lint violation (RPC_REQUEST_RESPONSE_UNIQUE) precisely because nothing
+// then stops the two RPCs' semantics from drifting apart while sharing a
+// type that implies they're interchangeable, which they are not.
+message SendAck {}
+message InstallSnapshotAck {}
+
+// RaftMessage is the single envelope every peer-to-peer Raft protocol
+// message (request or response) travels in. shard_id lets one Send call
+// carry traffic for any of the shards two peers share (Multi-Raft
+// multiplexing) — see docs/adr/0001 and pkg/raft/types.go's
+// "Multi-Raft multiplexing key" note.
+message RaftMessage {
+  string shard_id = 1;
+  oneof body {
+    RequestVoteRequest request_vote_request = 2;
+    RequestVoteResponse request_vote_response = 3;
+    AppendEntriesRequest append_entries_request = 4;
+    AppendEntriesResponse append_entries_response = 5;
+    InstallSnapshotResponse install_snapshot_response = 6;
+  }
 }
 
 enum EntryType {
@@ -31,45 +84,50 @@ message LogEntry {
 }
 
 message RequestVoteRequest {
-  string shard_id = 1;
-  uint64 term = 2;
-  string candidate_id = 3;
-  uint64 last_log_index = 4;
-  uint64 last_log_term = 5;
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
 }
 
 message RequestVoteResponse {
-  uint64 term = 1;
-  bool vote_granted = 2;
+  // voter_id identifies who is replying — needed because, unlike an
+  // in-process fake transport (where the caller of Step already knows
+  // "From" from the envelope it delivered), a real gRPC server receiving
+  // this as part of a RaftMessage has no other way to attribute the reply
+  // to a specific peer for InboundMessage.From.
+  string voter_id = 1;
+  uint64 term = 2;
+  bool vote_granted = 3;
 }
 
 message AppendEntriesRequest {
-  string shard_id = 1;
-  uint64 term = 2;
-  string leader_id = 3;
-  uint64 prev_log_index = 4;
-  uint64 prev_log_term = 5;
-  repeated LogEntry entries = 6;
-  uint64 leader_commit = 7;
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
 }
 
 message AppendEntriesResponse {
-  uint64 term = 1;
-  bool success = 2;
+  string follower_id = 1; // see RequestVoteResponse.voter_id's comment
+  uint64 term = 2;
+  bool success = 3;
   // On rejection: hints for fast conflict backtracking (Raft's "nextIndex
   // optimization") instead of decrementing nextIndex one at a time.
-  uint64 conflict_index = 3;
-  uint64 conflict_term = 4;
+  uint64 conflict_index = 4;
+  uint64 conflict_term = 5;
   // Set when this node knows the current leader, so a client (or peer)
   // that reached the wrong node can be redirected directly.
-  string leader_hint = 5;
+  string leader_hint = 6;
 }
 
 message ConfState {
   repeated string voters = 1;
 }
 
-message InstallSnapshotRequest {
+message InstallSnapshotChunk {
   string shard_id = 1;
   uint64 term = 2;
   string leader_id = 3;
@@ -82,5 +140,6 @@ message InstallSnapshotRequest {
 }
 
 message InstallSnapshotResponse {
-  uint64 term = 1;
+  string follower_id = 1; // see RequestVoteResponse.voter_id's comment
+  uint64 term = 2;
 }

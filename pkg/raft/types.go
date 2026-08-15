@@ -115,16 +115,38 @@ type StateMachine interface {
 	RestoreSnapshot(data []byte) error
 }
 
-// Transport sends Raft RPCs to peers. Raft Core depends only on this
-// interface — it never imports a gRPC package — so Raft Core's tests run
-// against an in-memory fake with zero real network I/O.
+// Transport delivers one outbound raft.Message to a peer.
+//
+// Design note (settled at Integration Checkpoint 1): this is deliberately
+// NOT shaped as per-RPC-kind request/response methods (an earlier version
+// was — SendRequestVote(req) (*resp, error), etc. — and that turned out to
+// be a mismatch with how Node actually replies: a response to an inbound
+// RequestVote or AppendEntries is just another outbound Message, queued in
+// a *later* Ready() call, never a synchronous return from Step. See
+// election.go/replication.go's n.send(from, kind, &raftpb.XxxResponse{...})
+// calls, and proto/raftpb/raft.proto's RaftTransportService.Send doc
+// comment for the full rationale). Send is fire-and-forget: its error
+// return means only "the message could not be handed to the peer" (dial
+// failure, etc.) — it carries no Raft-protocol information, because the
+// real reply (if the message was a request) arrives later as its own,
+// separate Send call in the other direction and is fed into the receiver's
+// own Node via Step, exactly like every other inbound message.
 //
 // Owned by: Client/API Protocol Layer workstream (internal/transport/grpc).
-// Consumed by: Raft Core.
+// Consumed by: the Ready-loop driver (cmd/kvnode today; internal/shard.Manager
+// once Multi-Raft sharding exists) — never by Raft Core itself, which only
+// ever populates Ready.Messages and has no Transport reference of its own.
 type Transport interface {
-	SendRequestVote(ctx context.Context, shard ShardID, target NodeID, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error)
-	SendAppendEntries(ctx context.Context, shard ShardID, target NodeID, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error)
-	SendInstallSnapshot(ctx context.Context, shard ShardID, target NodeID, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error)
+	// Send delivers msg to msg.To, in msg.Shard's namespace. msg carries its
+	// own destination and shard, so callers never need to pass them
+	// separately — the same Message the caller pulled out of Ready.Messages
+	// is exactly what gets sent.
+	Send(ctx context.Context, msg Message) error
+	// SendInstallSnapshotChunk is split out from Send because a snapshot
+	// transfer is chunked and, unlike every other message, its transport
+	// binding is streaming rather than a single envelope — see
+	// RaftTransportService.InstallSnapshot's proto doc comment.
+	SendInstallSnapshotChunk(ctx context.Context, shard ShardID, target NodeID, chunk *raftpb.InstallSnapshotChunk) error
 }
 
 // Status is a read-only snapshot of a Node's current view of the world,

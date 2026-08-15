@@ -19,8 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RaftTransportService_RequestVote_FullMethodName     = "/raft.v1.RaftTransportService/RequestVote"
-	RaftTransportService_AppendEntries_FullMethodName   = "/raft.v1.RaftTransportService/AppendEntries"
+	RaftTransportService_Send_FullMethodName            = "/raft.v1.RaftTransportService/Send"
 	RaftTransportService_InstallSnapshot_FullMethodName = "/raft.v1.RaftTransportService/InstallSnapshot"
 )
 
@@ -28,17 +27,44 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// RaftTransport carries peer-to-peer consensus RPCs between nodes hosting
-// the same shard's Raft group. Every RPC carries shard_id so a single
-// transport/connection can multiplex messages for many independently
-// managed Raft groups (Multi-Raft) — this is the seam between a
-// single-shard deployment and a sharded one; the wire protocol does not
-// change between them.
+// RaftTransportService carries peer-to-peer consensus RPCs between nodes
+// hosting the same shard's Raft group.
+//
+// Design note (added at Integration Checkpoint 1, after the original
+// per-RPC-type design — RequestVote/AppendEntries each a unary call
+// synchronously returning their own Response type — turned out not to
+// match how raft.Node actually behaves): Node never produces a reply
+// synchronously from Step. A reply to an inbound RequestVote or
+// AppendEntries is just another outbound raft.Message — carrying a
+// Response-typed payload, addressed back to the original sender — queued
+// for a *later* Ready() call, exactly like any other message (see
+// pkg/raft/types.go's Message/InboundMessage doc comments, and
+// internal/raft/election.go / replication.go, which both call n.send(from,
+// kind, &raftpb.XxxResponse{...}) to reply). A synchronous unary RPC
+// shaped "send a request, get a response back on the same call" cannot
+// carry that: the real response doesn't exist yet when the request
+// arrives, and by the time it does exist, it needs to travel as its own
+// outbound send back to the original requester — not as this call's
+// return value.
+//
+// So every Raft protocol message (request or response, either direction)
+// travels through the single Send RPC below as a RaftMessage envelope,
+// fire-and-forget (returns Empty; the real reply, if any, arrives later as
+// its own separate Send call in the other direction and is fed into the
+// receiver's own Node via Step, same as everything else). This matches
+// Node's actual internal model exactly, and is the same shape etcd/raft's
+// own transport (rafthttp) uses: peers just POST raftpb.Message envelopes
+// at each other.
 type RaftTransportServiceClient interface {
-	RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error)
-	AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error)
-	// Streamed because snapshots can be large (full keyspace dump for a shard).
-	InstallSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InstallSnapshotRequest, InstallSnapshotResponse], error)
+	Send(ctx context.Context, in *RaftMessage, opts ...grpc.CallOption) (*SendAck, error)
+	// InstallSnapshot is kept as its own client-streaming RPC (unlike Send
+	// above) because a full-keyspace snapshot can be too large for one
+	// message and needs to be chunked. This call's own synchronous
+	// completion is NOT the real InstallSnapshotResponse — Node produces
+	// that the same asynchronous way as every other reply, delivered back
+	// via a later Send call — callers must not rely on this RPC's return
+	// value for anything beyond "every chunk was received by the transport."
+	InstallSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InstallSnapshotChunk, InstallSnapshotAck], error)
 }
 
 type raftTransportServiceClient struct {
@@ -49,54 +75,71 @@ func NewRaftTransportServiceClient(cc grpc.ClientConnInterface) RaftTransportSer
 	return &raftTransportServiceClient{cc}
 }
 
-func (c *raftTransportServiceClient) RequestVote(ctx context.Context, in *RequestVoteRequest, opts ...grpc.CallOption) (*RequestVoteResponse, error) {
+func (c *raftTransportServiceClient) Send(ctx context.Context, in *RaftMessage, opts ...grpc.CallOption) (*SendAck, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RequestVoteResponse)
-	err := c.cc.Invoke(ctx, RaftTransportService_RequestVote_FullMethodName, in, out, cOpts...)
+	out := new(SendAck)
+	err := c.cc.Invoke(ctx, RaftTransportService_Send_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *raftTransportServiceClient) AppendEntries(ctx context.Context, in *AppendEntriesRequest, opts ...grpc.CallOption) (*AppendEntriesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(AppendEntriesResponse)
-	err := c.cc.Invoke(ctx, RaftTransportService_AppendEntries_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *raftTransportServiceClient) InstallSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InstallSnapshotRequest, InstallSnapshotResponse], error) {
+func (c *raftTransportServiceClient) InstallSnapshot(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[InstallSnapshotChunk, InstallSnapshotAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &RaftTransportService_ServiceDesc.Streams[0], RaftTransportService_InstallSnapshot_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[InstallSnapshotRequest, InstallSnapshotResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[InstallSnapshotChunk, InstallSnapshotAck]{ClientStream: stream}
 	return x, nil
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftTransportService_InstallSnapshotClient = grpc.ClientStreamingClient[InstallSnapshotRequest, InstallSnapshotResponse]
+type RaftTransportService_InstallSnapshotClient = grpc.ClientStreamingClient[InstallSnapshotChunk, InstallSnapshotAck]
 
 // RaftTransportServiceServer is the server API for RaftTransportService service.
 // All implementations must embed UnimplementedRaftTransportServiceServer
 // for forward compatibility.
 //
-// RaftTransport carries peer-to-peer consensus RPCs between nodes hosting
-// the same shard's Raft group. Every RPC carries shard_id so a single
-// transport/connection can multiplex messages for many independently
-// managed Raft groups (Multi-Raft) — this is the seam between a
-// single-shard deployment and a sharded one; the wire protocol does not
-// change between them.
+// RaftTransportService carries peer-to-peer consensus RPCs between nodes
+// hosting the same shard's Raft group.
+//
+// Design note (added at Integration Checkpoint 1, after the original
+// per-RPC-type design — RequestVote/AppendEntries each a unary call
+// synchronously returning their own Response type — turned out not to
+// match how raft.Node actually behaves): Node never produces a reply
+// synchronously from Step. A reply to an inbound RequestVote or
+// AppendEntries is just another outbound raft.Message — carrying a
+// Response-typed payload, addressed back to the original sender — queued
+// for a *later* Ready() call, exactly like any other message (see
+// pkg/raft/types.go's Message/InboundMessage doc comments, and
+// internal/raft/election.go / replication.go, which both call n.send(from,
+// kind, &raftpb.XxxResponse{...}) to reply). A synchronous unary RPC
+// shaped "send a request, get a response back on the same call" cannot
+// carry that: the real response doesn't exist yet when the request
+// arrives, and by the time it does exist, it needs to travel as its own
+// outbound send back to the original requester — not as this call's
+// return value.
+//
+// So every Raft protocol message (request or response, either direction)
+// travels through the single Send RPC below as a RaftMessage envelope,
+// fire-and-forget (returns Empty; the real reply, if any, arrives later as
+// its own separate Send call in the other direction and is fed into the
+// receiver's own Node via Step, same as everything else). This matches
+// Node's actual internal model exactly, and is the same shape etcd/raft's
+// own transport (rafthttp) uses: peers just POST raftpb.Message envelopes
+// at each other.
 type RaftTransportServiceServer interface {
-	RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error)
-	AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error)
-	// Streamed because snapshots can be large (full keyspace dump for a shard).
-	InstallSnapshot(grpc.ClientStreamingServer[InstallSnapshotRequest, InstallSnapshotResponse]) error
+	Send(context.Context, *RaftMessage) (*SendAck, error)
+	// InstallSnapshot is kept as its own client-streaming RPC (unlike Send
+	// above) because a full-keyspace snapshot can be too large for one
+	// message and needs to be chunked. This call's own synchronous
+	// completion is NOT the real InstallSnapshotResponse — Node produces
+	// that the same asynchronous way as every other reply, delivered back
+	// via a later Send call — callers must not rely on this RPC's return
+	// value for anything beyond "every chunk was received by the transport."
+	InstallSnapshot(grpc.ClientStreamingServer[InstallSnapshotChunk, InstallSnapshotAck]) error
 	mustEmbedUnimplementedRaftTransportServiceServer()
 }
 
@@ -107,13 +150,10 @@ type RaftTransportServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedRaftTransportServiceServer struct{}
 
-func (UnimplementedRaftTransportServiceServer) RequestVote(context.Context, *RequestVoteRequest) (*RequestVoteResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RequestVote not implemented")
+func (UnimplementedRaftTransportServiceServer) Send(context.Context, *RaftMessage) (*SendAck, error) {
+	return nil, status.Error(codes.Unimplemented, "method Send not implemented")
 }
-func (UnimplementedRaftTransportServiceServer) AppendEntries(context.Context, *AppendEntriesRequest) (*AppendEntriesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method AppendEntries not implemented")
-}
-func (UnimplementedRaftTransportServiceServer) InstallSnapshot(grpc.ClientStreamingServer[InstallSnapshotRequest, InstallSnapshotResponse]) error {
+func (UnimplementedRaftTransportServiceServer) InstallSnapshot(grpc.ClientStreamingServer[InstallSnapshotChunk, InstallSnapshotAck]) error {
 	return status.Error(codes.Unimplemented, "method InstallSnapshot not implemented")
 }
 func (UnimplementedRaftTransportServiceServer) mustEmbedUnimplementedRaftTransportServiceServer() {}
@@ -137,48 +177,30 @@ func RegisterRaftTransportServiceServer(s grpc.ServiceRegistrar, srv RaftTranspo
 	s.RegisterService(&RaftTransportService_ServiceDesc, srv)
 }
 
-func _RaftTransportService_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RequestVoteRequest)
+func _RaftTransportService_Send_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RaftMessage)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(RaftTransportServiceServer).RequestVote(ctx, in)
+		return srv.(RaftTransportServiceServer).Send(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: RaftTransportService_RequestVote_FullMethodName,
+		FullMethod: RaftTransportService_Send_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftTransportServiceServer).RequestVote(ctx, req.(*RequestVoteRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _RaftTransportService_AppendEntries_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(AppendEntriesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(RaftTransportServiceServer).AppendEntries(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: RaftTransportService_AppendEntries_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(RaftTransportServiceServer).AppendEntries(ctx, req.(*AppendEntriesRequest))
+		return srv.(RaftTransportServiceServer).Send(ctx, req.(*RaftMessage))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
 func _RaftTransportService_InstallSnapshot_Handler(srv interface{}, stream grpc.ServerStream) error {
-	return srv.(RaftTransportServiceServer).InstallSnapshot(&grpc.GenericServerStream[InstallSnapshotRequest, InstallSnapshotResponse]{ServerStream: stream})
+	return srv.(RaftTransportServiceServer).InstallSnapshot(&grpc.GenericServerStream[InstallSnapshotChunk, InstallSnapshotAck]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type RaftTransportService_InstallSnapshotServer = grpc.ClientStreamingServer[InstallSnapshotRequest, InstallSnapshotResponse]
+type RaftTransportService_InstallSnapshotServer = grpc.ClientStreamingServer[InstallSnapshotChunk, InstallSnapshotAck]
 
 // RaftTransportService_ServiceDesc is the grpc.ServiceDesc for RaftTransportService service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -188,12 +210,8 @@ var RaftTransportService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*RaftTransportServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "RequestVote",
-			Handler:    _RaftTransportService_RequestVote_Handler,
-		},
-		{
-			MethodName: "AppendEntries",
-			Handler:    _RaftTransportService_AppendEntries_Handler,
+			MethodName: "Send",
+			Handler:    _RaftTransportService_Send_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

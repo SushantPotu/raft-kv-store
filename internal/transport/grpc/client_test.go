@@ -12,32 +12,28 @@ import (
 	"github.com/SushantPotu/raft-kv-store/pkg/raftpb"
 )
 
-// recordingRaftServer captures the last request it received for each RPC,
-// so tests can assert on exactly what Client put on the wire (in
-// particular, that shard_id was stamped correctly).
+// recordingRaftServer captures the last envelope/chunk it received, so
+// tests can assert on exactly what Client put on the wire (in particular,
+// that shard_id was stamped correctly and the oneof body round-trips).
 type recordingRaftServer struct {
 	raftpb.UnimplementedRaftTransportServiceServer
 
-	lastAppendEntries *raftpb.AppendEntriesRequest
-	lastRequestVote   *raftpb.RequestVoteRequest
+	lastEnvelope *raftpb.RaftMessage
+	lastChunk    *raftpb.InstallSnapshotChunk
 }
 
-func (s *recordingRaftServer) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	s.lastRequestVote = req
-	return &raftpb.RequestVoteResponse{Term: req.GetTerm(), VoteGranted: true}, nil
-}
-
-func (s *recordingRaftServer) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
-	s.lastAppendEntries = req
-	return &raftpb.AppendEntriesResponse{Term: req.GetTerm(), Success: true}, nil
+func (s *recordingRaftServer) Send(ctx context.Context, envelope *raftpb.RaftMessage) (*raftpb.SendAck, error) {
+	s.lastEnvelope = envelope
+	return &raftpb.SendAck{}, nil
 }
 
 func (s *recordingRaftServer) InstallSnapshot(stream raftpb.RaftTransportService_InstallSnapshotServer) error {
-	req, err := stream.Recv()
+	chunk, err := stream.Recv()
 	if err != nil {
 		return err
 	}
-	return stream.SendAndClose(&raftpb.InstallSnapshotResponse{Term: req.GetTerm()})
+	s.lastChunk = chunk
+	return stream.SendAndClose(&raftpb.InstallSnapshotAck{})
 }
 
 // startRecordingServer starts a real RaftTransportService gRPC server on
@@ -63,82 +59,104 @@ func newTestClient(t *testing.T, id raft.NodeID, addr string) *Client {
 	return c
 }
 
-// TestSendAppendEntriesRoundTripsShardID verifies Client.SendAppendEntries
-// dials the registered peer, stamps the given shard onto the outgoing
-// request (overriding whatever the caller already set, since Client is
-// meant to be the single place this seam gets enforced), and returns the
-// server's real response over a real gRPC connection.
-func TestSendAppendEntriesRoundTripsShardID(t *testing.T) {
+// TestSendAppendEntriesRequestRoundTrips verifies Client.Send dials the
+// registered peer, wraps an AppendEntriesRequest payload in a RaftMessage
+// envelope stamped with the given shard, and the server receives it intact.
+func TestSendAppendEntriesRequestRoundTrips(t *testing.T) {
 	srv := &recordingRaftServer{}
 	addr := startRecordingServer(t, srv)
 	c := newTestClient(t, "peer-1", addr)
 
-	req := &raftpb.AppendEntriesRequest{
-		ShardId:  "wrong-shard", // Client must overwrite this with the shard arg
-		Term:     7,
-		LeaderId: "leader-1",
-		Entries: []*raftpb.LogEntry{
-			{Term: 7, Index: 1, Type: raftpb.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("x")},
+	msg := raft.Message{
+		To:    "peer-1",
+		Shard: "shard-42",
+		Kind:  raft.MsgAppendEntries,
+		Payload: &raftpb.AppendEntriesRequest{
+			Term:     7,
+			LeaderId: "leader-1",
+			Entries: []*raftpb.LogEntry{
+				{Term: 7, Index: 1, Type: raftpb.EntryType_ENTRY_TYPE_NORMAL, Data: []byte("x")},
+			},
 		},
 	}
-	resp, err := c.SendAppendEntries(context.Background(), "shard-42", "peer-1", req)
-	if err != nil {
-		t.Fatalf("SendAppendEntries: %v", err)
-	}
-	if resp.GetTerm() != 7 || !resp.GetSuccess() {
-		t.Fatalf("unexpected response: %+v", resp)
+	if err := c.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
 
-	if srv.lastAppendEntries == nil {
-		t.Fatal("server never received AppendEntries")
+	if srv.lastEnvelope == nil {
+		t.Fatal("server never received a RaftMessage")
 	}
-	if got := srv.lastAppendEntries.GetShardId(); got != "shard-42" {
+	if got := srv.lastEnvelope.GetShardId(); got != "shard-42" {
 		t.Fatalf("shard_id on wire = %q, want %q", got, "shard-42")
 	}
-	if got := srv.lastAppendEntries.GetLeaderId(); got != "leader-1" {
+	body, ok := srv.lastEnvelope.GetBody().(*raftpb.RaftMessage_AppendEntriesRequest)
+	if !ok {
+		t.Fatalf("envelope body type = %T, want *RaftMessage_AppendEntriesRequest", srv.lastEnvelope.GetBody())
+	}
+	if got := body.AppendEntriesRequest.GetLeaderId(); got != "leader-1" {
 		t.Fatalf("leader_id on wire = %q, want %q", got, "leader-1")
 	}
-	if len(srv.lastAppendEntries.GetEntries()) != 1 {
-		t.Fatalf("entries on wire = %d, want 1", len(srv.lastAppendEntries.GetEntries()))
+	if len(body.AppendEntriesRequest.GetEntries()) != 1 {
+		t.Fatalf("entries on wire = %d, want 1", len(body.AppendEntriesRequest.GetEntries()))
 	}
 }
 
-// TestSendRequestVoteRoundTripsShardID mirrors the AppendEntries test for
-// RequestVote.
-func TestSendRequestVoteRoundTripsShardID(t *testing.T) {
+// TestSendRequestVoteResponseRoundTrips verifies a *response*-typed
+// payload (the case the original per-RPC-type Transport design couldn't
+// carry — see raft.Transport's doc comment) travels through Send just as
+// well as a request-typed one.
+func TestSendRequestVoteResponseRoundTrips(t *testing.T) {
 	srv := &recordingRaftServer{}
 	addr := startRecordingServer(t, srv)
 	c := newTestClient(t, "peer-1", addr)
 
-	req := &raftpb.RequestVoteRequest{Term: 3, CandidateId: "candidate-1"}
-	resp, err := c.SendRequestVote(context.Background(), "shard-7", "peer-1", req)
-	if err != nil {
-		t.Fatalf("SendRequestVote: %v", err)
+	msg := raft.Message{
+		To:    "peer-1",
+		Shard: "shard-7",
+		Kind:  raft.MsgRequestVote,
+		Payload: &raftpb.RequestVoteResponse{
+			VoterId:     "voter-9",
+			Term:        3,
+			VoteGranted: true,
+		},
 	}
-	if resp.GetTerm() != 3 || !resp.GetVoteGranted() {
-		t.Fatalf("unexpected response: %+v", resp)
+	if err := c.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
-	if srv.lastRequestVote.GetShardId() != "shard-7" {
-		t.Fatalf("shard_id on wire = %q, want %q", srv.lastRequestVote.GetShardId(), "shard-7")
+
+	if srv.lastEnvelope.GetShardId() != "shard-7" {
+		t.Fatalf("shard_id on wire = %q, want %q", srv.lastEnvelope.GetShardId(), "shard-7")
+	}
+	body, ok := srv.lastEnvelope.GetBody().(*raftpb.RaftMessage_RequestVoteResponse)
+	if !ok {
+		t.Fatalf("envelope body type = %T, want *RaftMessage_RequestVoteResponse", srv.lastEnvelope.GetBody())
+	}
+	if !body.RequestVoteResponse.GetVoteGranted() || body.RequestVoteResponse.GetVoterId() != "voter-9" {
+		t.Fatalf("unexpected response payload: %+v", body.RequestVoteResponse)
 	}
 }
 
-// TestSendInstallSnapshotRoundTrips verifies the client-streaming
-// InstallSnapshot RPC is driven correctly from Client's unary-looking
-// SendInstallSnapshot method (open stream, send one chunk, close and
-// receive the response).
-func TestSendInstallSnapshotRoundTrips(t *testing.T) {
+// TestSendInstallSnapshotChunkRoundTrips verifies the client-streaming
+// InstallSnapshot RPC is driven correctly from Client's per-chunk
+// SendInstallSnapshotChunk method (open stream, send one chunk, close).
+func TestSendInstallSnapshotChunkRoundTrips(t *testing.T) {
 	srv := &recordingRaftServer{}
 	addr := startRecordingServer(t, srv)
 	c := newTestClient(t, "peer-1", addr)
 
-	req := &raftpb.InstallSnapshotRequest{Term: 9, LeaderId: "leader-1", Data: []byte("snap"), Done: true}
-	resp, err := c.SendInstallSnapshot(context.Background(), "shard-1", "peer-1", req)
-	if err != nil {
-		t.Fatalf("SendInstallSnapshot: %v", err)
+	chunk := &raftpb.InstallSnapshotChunk{Term: 9, LeaderId: "leader-1", Data: []byte("snap"), Done: true}
+	if err := c.SendInstallSnapshotChunk(context.Background(), "shard-1", "peer-1", chunk); err != nil {
+		t.Fatalf("SendInstallSnapshotChunk: %v", err)
 	}
-	if resp.GetTerm() != 9 {
-		t.Fatalf("response term = %d, want 9", resp.GetTerm())
+
+	if srv.lastChunk == nil {
+		t.Fatal("server never received an InstallSnapshot chunk")
+	}
+	if srv.lastChunk.GetShardId() != "shard-1" {
+		t.Fatalf("shard_id on wire = %q, want %q", srv.lastChunk.GetShardId(), "shard-1")
+	}
+	if srv.lastChunk.GetTerm() != 9 || string(srv.lastChunk.GetData()) != "snap" {
+		t.Fatalf("unexpected chunk: %+v", srv.lastChunk)
 	}
 }
 
@@ -148,8 +166,26 @@ func TestSendToUnregisteredPeerFails(t *testing.T) {
 	c := NewClient(grpc.WithTransportCredentials(insecure.NewCredentials()))
 	t.Cleanup(func() { _ = c.Close() })
 
-	_, err := c.SendAppendEntries(context.Background(), "shard-1", "ghost", &raftpb.AppendEntriesRequest{})
+	err := c.Send(context.Background(), raft.Message{
+		To:      "ghost",
+		Shard:   "shard-1",
+		Kind:    raft.MsgAppendEntries,
+		Payload: &raftpb.AppendEntriesRequest{},
+	})
 	if err == nil {
 		t.Fatal("expected error sending to a peer with no registered address")
+	}
+}
+
+// TestSendUnsupportedPayloadTypeFails confirms Client rejects a payload it
+// doesn't recognize rather than silently sending an empty envelope.
+func TestSendUnsupportedPayloadTypeFails(t *testing.T) {
+	srv := &recordingRaftServer{}
+	addr := startRecordingServer(t, srv)
+	c := newTestClient(t, "peer-1", addr)
+
+	err := c.Send(context.Background(), raft.Message{To: "peer-1", Shard: "shard-1", Payload: "not a raftpb type"})
+	if err == nil {
+		t.Fatal("expected error for unsupported payload type")
 	}
 }

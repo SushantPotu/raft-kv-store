@@ -57,20 +57,17 @@ func (r *NodeRegistry) get(shard raft.ShardID) (raft.Node, bool) {
 }
 
 // Server implements raftpb.RaftTransportServiceServer, dispatching each
-// inbound peer RPC to the right local raft.Node by shard_id via
-// NodeRegistry, and translating it into a raft.InboundMessage for
+// inbound RaftMessage envelope to the right local raft.Node by shard_id
+// via NodeRegistry, and translating it into a raft.InboundMessage for
 // Node.Step.
 //
-// Response contract: per the Ready-loop design (docs/adr/0001), Node.Step
-// only feeds a message in — it does not synchronously return the
-// eventual reply (e.g. a RequestVote's vote_granted). That reply, if any,
-// is produced later as an outbound raft.Message in a future Ready and
-// sent back out through Transport like any other message. Server
-// therefore returns a zero-value response immediately after Step
-// succeeds, exactly as pkg/raft/rafttest.FakeTransport already does for
-// the same reason. Bridging a synchronous RPC's response to the
-// asynchronous Ready-produced reply is internal/shard.Manager's job once
-// it exists, not this Server's.
+// Response contract: per raft.Transport.Send's doc comment, Node.Step only
+// feeds a message in — it never synchronously returns the eventual reply
+// (e.g. a RequestVote's vote_granted). That reply, if any, is produced
+// later as its own outbound raft.Message and delivered back via a
+// separate Send call in the other direction, which is what actually
+// carries it — not this RPC's return value. Server therefore returns
+// SendAck{} unconditionally once Step succeeds.
 type Server struct {
 	raftpb.UnimplementedRaftTransportServiceServer
 
@@ -92,64 +89,74 @@ func (s *Server) nodeFor(shardID string) (raft.Node, error) {
 	return node, nil
 }
 
-// RequestVote implements raftpb.RaftTransportServiceServer.
-func (s *Server) RequestVote(ctx context.Context, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	node, err := s.nodeFor(req.GetShardId())
+// Send implements raftpb.RaftTransportServiceServer. It unwraps the
+// envelope's oneof body, and — since neither request nor response
+// payloads carry the sender's NodeID at the raft.Message level (only the
+// wire messages that need one do, per RequestVoteResponse.voter_id's and
+// AppendEntriesResponse.follower_id's comments) — derives InboundMessage.From
+// from whichever identity field the concrete payload type carries.
+func (s *Server) Send(ctx context.Context, envelope *raftpb.RaftMessage) (*raftpb.SendAck, error) {
+	node, err := s.nodeFor(envelope.GetShardId())
 	if err != nil {
 		return nil, err
 	}
-	msg := raft.InboundMessage{
-		From:    raft.NodeID(req.GetCandidateId()),
-		Shard:   raft.ShardID(req.GetShardId()),
-		Kind:    raft.MsgRequestVote,
-		Payload: req,
-	}
-	if err := node.Step(ctx, msg); err != nil {
-		return nil, status.Errorf(codes.Internal, "grpctransport: Step: %v", err)
-	}
-	return &raftpb.RequestVoteResponse{}, nil
-}
 
-// AppendEntries implements raftpb.RaftTransportServiceServer.
-func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
-	node, err := s.nodeFor(req.GetShardId())
-	if err != nil {
-		return nil, err
+	var msg raft.InboundMessage
+	msg.Shard = raft.ShardID(envelope.GetShardId())
+
+	switch body := envelope.GetBody().(type) {
+	case *raftpb.RaftMessage_RequestVoteRequest:
+		msg.Kind = raft.MsgRequestVote
+		msg.From = raft.NodeID(body.RequestVoteRequest.GetCandidateId())
+		msg.Payload = body.RequestVoteRequest
+	case *raftpb.RaftMessage_RequestVoteResponse:
+		msg.Kind = raft.MsgRequestVote
+		msg.From = raft.NodeID(body.RequestVoteResponse.GetVoterId())
+		msg.Payload = body.RequestVoteResponse
+	case *raftpb.RaftMessage_AppendEntriesRequest:
+		msg.Kind = raft.MsgAppendEntries
+		msg.From = raft.NodeID(body.AppendEntriesRequest.GetLeaderId())
+		msg.Payload = body.AppendEntriesRequest
+	case *raftpb.RaftMessage_AppendEntriesResponse:
+		msg.Kind = raft.MsgAppendEntries
+		msg.From = raft.NodeID(body.AppendEntriesResponse.GetFollowerId())
+		msg.Payload = body.AppendEntriesResponse
+	case *raftpb.RaftMessage_InstallSnapshotResponse:
+		msg.Kind = raft.MsgInstallSnapshot
+		msg.From = raft.NodeID(body.InstallSnapshotResponse.GetFollowerId())
+		msg.Payload = body.InstallSnapshotResponse
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "grpctransport: RaftMessage with empty or unknown body (%T)", body)
 	}
-	msg := raft.InboundMessage{
-		From:    raft.NodeID(req.GetLeaderId()),
-		Shard:   raft.ShardID(req.GetShardId()),
-		Kind:    raft.MsgAppendEntries,
-		Payload: req,
-	}
+
 	if err := node.Step(ctx, msg); err != nil {
 		return nil, status.Errorf(codes.Internal, "grpctransport: Step: %v", err)
 	}
-	return &raftpb.AppendEntriesResponse{}, nil
+	return &raftpb.SendAck{}, nil
 }
 
 // InstallSnapshot implements raftpb.RaftTransportServiceServer. Per
-// Client.SendInstallSnapshot's doc comment, each stream on this server
-// side currently carries exactly one chunk (sent, then the client closes
-// its send side) — but this handler is written to loop on Recv until
-// io.EOF regardless, so it keeps working unmodified if a future caller
-// reuses one stream across multiple chunks.
+// Client.SendInstallSnapshotChunk's doc comment, each stream on this
+// server side currently carries exactly one chunk (sent, then the client
+// closes its send side) — but this handler is written to loop on Recv
+// until io.EOF regardless, so it keeps working unmodified if a future
+// caller reuses one stream across multiple chunks.
 func (s *Server) InstallSnapshot(stream raftpb.RaftTransportService_InstallSnapshotServer) error {
 	var (
 		node    raft.Node
 		shardID string
 	)
 	for {
-		req, err := stream.Recv()
+		chunk, err := stream.Recv()
 		if err == io.EOF {
-			return stream.SendAndClose(&raftpb.InstallSnapshotResponse{})
+			return stream.SendAndClose(&raftpb.InstallSnapshotAck{})
 		}
 		if err != nil {
 			return fmt.Errorf("grpctransport: recv InstallSnapshot chunk: %w", err)
 		}
 
 		if node == nil {
-			shardID = req.GetShardId()
+			shardID = chunk.GetShardId()
 			n, err := s.nodeFor(shardID)
 			if err != nil {
 				return err
@@ -158,10 +165,10 @@ func (s *Server) InstallSnapshot(stream raftpb.RaftTransportService_InstallSnaps
 		}
 
 		msg := raft.InboundMessage{
-			From:    raft.NodeID(req.GetLeaderId()),
+			From:    raft.NodeID(chunk.GetLeaderId()),
 			Shard:   raft.ShardID(shardID),
 			Kind:    raft.MsgInstallSnapshot,
-			Payload: req,
+			Payload: chunk,
 		}
 		if err := node.Step(stream.Context(), msg); err != nil {
 			return status.Errorf(codes.Internal, "grpctransport: Step: %v", err)

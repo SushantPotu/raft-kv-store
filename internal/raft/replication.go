@@ -74,7 +74,6 @@ func (n *Node) sendAppendEntriesToLocked(p raft.NodeID) {
 	n.appendInflight[p] = prevIdx + raft.LogIndex(len(entries))
 	n.replicating[p] = true
 	n.send(p, raft.MsgAppendEntries, &raftpb.AppendEntriesRequest{
-		ShardId:      string(n.shard),
 		Term:         uint64(n.term),
 		LeaderId:     string(n.id),
 		PrevLogIndex: uint64(prevIdx),
@@ -94,6 +93,7 @@ func (n *Node) handleAppendEntriesLocked(from raft.NodeID, req *raftpb.AppendEnt
 	// 1. Reply false if term < currentTerm.
 	if term < n.term {
 		n.send(from, raft.MsgAppendEntries, &raftpb.AppendEntriesResponse{
+			FollowerId: string(n.id),
 			Term:       uint64(n.term),
 			Success:    false,
 			LeaderHint: string(n.leader),
@@ -119,6 +119,7 @@ func (n *Node) handleAppendEntriesLocked(from raft.NodeID, req *raftpb.AppendEnt
 	if myTerm, ok := n.log.termAt(prevIdx); !ok || myTerm != prevTerm {
 		conflictIdx, conflictTerm := n.log.conflictHint(prevIdx)
 		n.send(from, raft.MsgAppendEntries, &raftpb.AppendEntriesResponse{
+			FollowerId:    string(n.id),
 			Term:          uint64(n.term),
 			Success:       false,
 			ConflictIndex: uint64(conflictIdx),
@@ -149,6 +150,7 @@ func (n *Node) handleAppendEntriesLocked(from raft.NodeID, req *raftpb.AppendEnt
 	}
 
 	n.send(from, raft.MsgAppendEntries, &raftpb.AppendEntriesResponse{
+		FollowerId: string(n.id),
 		Term:       uint64(n.term),
 		Success:    true,
 		LeaderHint: string(n.leader),

@@ -20,7 +20,7 @@ type steppingNode struct {
 
 var _ raft.Node = (*steppingNode)(nil)
 
-func (n *steppingNode) Propose(ctx context.Context, data []byte) error                  { return nil }
+func (n *steppingNode) Propose(ctx context.Context, data []byte) error                 { return nil }
 func (n *steppingNode) ProposeConfChange(ctx context.Context, cc raft.ConfChange) error { return nil }
 func (n *steppingNode) ReadIndex(ctx context.Context, ctxToken []byte) error            { return nil }
 func (n *steppingNode) Step(ctx context.Context, msg raft.InboundMessage) error {
@@ -33,19 +33,20 @@ func (n *steppingNode) Advance()                 {}
 func (n *steppingNode) Tick()                    {}
 func (n *steppingNode) Status() raft.Status      { return raft.Status{} }
 
-func TestServerDispatchesByShardID(t *testing.T) {
+func TestServerDispatchesRequestByShardID(t *testing.T) {
 	reg := NewNodeRegistry()
 	node := &steppingNode{}
 	reg.Register("shard-a", node)
 
 	s := NewServer(reg)
-	_, err := s.AppendEntries(context.Background(), &raftpb.AppendEntriesRequest{
-		ShardId:  "shard-a",
-		LeaderId: "leader-1",
-		Term:     5,
-	})
-	if err != nil {
-		t.Fatalf("AppendEntries: %v", err)
+	envelope := &raftpb.RaftMessage{
+		ShardId: "shard-a",
+		Body: &raftpb.RaftMessage_AppendEntriesRequest{
+			AppendEntriesRequest: &raftpb.AppendEntriesRequest{LeaderId: "leader-1", Term: 5},
+		},
+	}
+	if _, err := s.Send(context.Background(), envelope); err != nil {
+		t.Fatalf("Send: %v", err)
 	}
 	if !node.stepped {
 		t.Fatal("expected registered node's Step to be called")
@@ -58,10 +59,55 @@ func TestServerDispatchesByShardID(t *testing.T) {
 	}
 }
 
+// TestServerDispatchesResponseByShardID verifies a response-typed envelope
+// body is routed too, with From derived from the response's own identity
+// field (voter_id/follower_id) rather than a request field — this is the
+// exact case the original per-RPC-type Transport design couldn't handle.
+func TestServerDispatchesResponseByShardID(t *testing.T) {
+	reg := NewNodeRegistry()
+	node := &steppingNode{}
+	reg.Register("shard-a", node)
+
+	s := NewServer(reg)
+	envelope := &raftpb.RaftMessage{
+		ShardId: "shard-a",
+		Body: &raftpb.RaftMessage_RequestVoteResponse{
+			RequestVoteResponse: &raftpb.RequestVoteResponse{VoterId: "voter-2", Term: 5, VoteGranted: true},
+		},
+	}
+	if _, err := s.Send(context.Background(), envelope); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if node.lastMsg.Kind != raft.MsgRequestVote {
+		t.Fatalf("Step message kind = %v, want MsgRequestVote", node.lastMsg.Kind)
+	}
+	if node.lastMsg.From != "voter-2" {
+		t.Fatalf("Step message From = %q, want %q", node.lastMsg.From, "voter-2")
+	}
+	if _, ok := node.lastMsg.Payload.(*raftpb.RequestVoteResponse); !ok {
+		t.Fatalf("Step message payload type = %T, want *RequestVoteResponse", node.lastMsg.Payload)
+	}
+}
+
 func TestServerUnknownShardReturnsNotFound(t *testing.T) {
 	s := NewServer(NewNodeRegistry())
-	_, err := s.AppendEntries(context.Background(), &raftpb.AppendEntriesRequest{ShardId: "missing"})
+	envelope := &raftpb.RaftMessage{
+		ShardId: "missing",
+		Body:    &raftpb.RaftMessage_AppendEntriesRequest{AppendEntriesRequest: &raftpb.AppendEntriesRequest{}},
+	}
+	_, err := s.Send(context.Background(), envelope)
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("error = %v, want codes.NotFound", err)
+	}
+}
+
+func TestServerEmptyBodyReturnsInvalidArgument(t *testing.T) {
+	reg := NewNodeRegistry()
+	reg.Register("shard-a", &steppingNode{})
+	s := NewServer(reg)
+
+	_, err := s.Send(context.Background(), &raftpb.RaftMessage{ShardId: "shard-a"})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("error = %v, want codes.InvalidArgument", err)
 	}
 }
