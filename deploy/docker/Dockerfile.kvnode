@@ -1,8 +1,11 @@
-# Placeholder until Checkpoint 1 lands cmd/kvnode/main.go (Storage Engine +
-# Raft Core + Client/API workstreams wired together). Structurally correct
-# multi-stage build so `docker build` "just works" the moment that binary
-# exists — nothing here should need to change at that point.
-FROM golang:1.23 AS build
+# Integration Checkpoint 1: cmd/kvnode/main.go wires together the Storage
+# Engine, Raft Core, and Client/API Protocol Layer workstreams.
+#
+# Base image bumped from golang:1.23 to golang:1.25 to match go.mod's
+# `go 1.25.0` directive — the placeholder image predated go.mod being
+# bumped and would fail `go build` (go.mod requires a newer toolchain than
+# golang:1.23 ships).
+FROM golang:1.25 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

@@ -8,9 +8,21 @@ package raft
 
 import (
 	"context"
+	"errors"
 
 	"github.com/SushantPotu/raft-kv-store/pkg/raftpb"
 )
+
+// ErrNotLeader is the sentinel a Node implementation's Propose/
+// ProposeConfChange must wrap (via fmt.Errorf("%w ...", ErrNotLeader, ...))
+// when rejecting a call because this replica isn't the shard's current
+// leader. It lives here, not in internal/raft, specifically so a caller
+// like internal/server (which depends only on this package's interfaces,
+// never on internal/raft directly — see this file's package doc comment)
+// can distinguish "not leader, redirect the client via Status().Leader"
+// from every other Propose failure with errors.Is, without needing to
+// import the concrete Raft Core package.
+var ErrNotLeader = errors.New("raft: not the leader")
 
 type NodeID string
 
@@ -160,12 +172,17 @@ type Status struct {
 }
 
 // Ready bundles everything a Node produced during one step of progress
-// that the caller (internal/shard.Manager) must act on: persist Entries
-// and HardState (in that order, before doing anything else), send
-// Messages to peers, and apply CommittedEntries to the StateMachine. This
-// is the etcd/raft "Ready loop" shape — it keeps Node's internals fully
-// synchronous and side-effect-free, which is what makes the deterministic
-// simulation harness (internal/raft/simulate) possible.
+// that the caller (cmd/kvnode's Ready-loop driver today; internal/shard.Manager
+// once Multi-Raft sharding exists) must act on: persist Entries and
+// HardState (in that order, before doing anything else), send Messages to
+// peers, and apply CommittedEntries to the StateMachine. This is inspired
+// by etcd/raft's "Ready loop" shape but not identical to it: etcd/raft
+// feeds a single long-lived channel from a background goroutine; this
+// Node has no background goroutine at all — see Ready()'s own doc comment
+// for the call-and-check contract that results. Either way, the effect is
+// the same: Node's internals stay fully synchronous and side-effect-free,
+// which is what makes the deterministic simulation harness
+// (internal/raft/simulate) possible.
 type Ready struct {
 	HardState       *HardState // nil if unchanged
 	Entries         []LogEntry // newly appended, must be persisted before sending Messages
@@ -213,6 +230,11 @@ type Node interface {
 	// proposal has been handed to the replication pipeline, not once it's
 	// committed — callers needing the result should track it via the
 	// StateMachine.Apply return value surfaced through Ready.CommittedEntries.
+	// If this replica isn't the shard's current leader, Propose returns an
+	// error wrapping ErrNotLeader instead of attempting anything — callers
+	// (e.g. internal/server.KVServer) check for that specifically with
+	// errors.Is and redirect the client via Status().Leader rather than
+	// surfacing a generic failure.
 	Propose(ctx context.Context, data []byte) error
 	ProposeConfChange(ctx context.Context, cc ConfChange) error
 	// ReadIndex implements the linearizable-read protocol (Workstream F):
@@ -222,9 +244,15 @@ type Node interface {
 	// Step feeds an inbound message (translated from a received RPC) into
 	// the state machine.
 	Step(ctx context.Context, msg InboundMessage) error
-	// Ready delivers a Ready struct whenever there is new state to persist,
-	// send, or apply. The caller must call Advance() after fully processing
-	// one Ready before the next is produced.
+	// Ready is call-and-check, not a long-lived channel to range over: each
+	// call synchronously packages up whatever accumulated since the last
+	// Advance() (there is no background goroutine feeding it) into a
+	// length-1 channel, already-filled if there's work or left empty
+	// forever otherwise. Callers poll it with a non-blocking receive —
+	// `select { case rd := <-node.Ready(): ...; default: }` — exactly as
+	// internal/raft/simulate.Cluster.drainReady and cmd/kvnode's Ready-loop
+	// driver both do. The caller must call Advance() after fully processing
+	// one non-empty Ready before the next call to Ready() will produce one.
 	Ready() <-chan Ready
 	Advance()
 	// Tick drives logical time forward (election/heartbeat timeouts). The

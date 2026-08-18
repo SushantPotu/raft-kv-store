@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/SushantPotu/raft-kv-store/internal/statemachine"
 	"github.com/SushantPotu/raft-kv-store/pkg/raft"
 )
 
@@ -49,7 +50,7 @@ type SingleNodeStub struct {
 	// would be pure ceremony for a stub whose Propose never actually defers
 	// anything.
 	pendingMu sync.Mutex
-	pending   map[string]commandResult
+	pending   map[string]statemachine.CommandResult
 }
 
 // NewSingleNodeStub constructs a stub bound to the given fake state
@@ -59,7 +60,7 @@ func newSingleNodeStub(id raft.NodeID, sm *fakeStateMachine) *SingleNodeStub {
 	return &SingleNodeStub{
 		id:      id,
 		sm:      sm,
-		pending: make(map[string]commandResult),
+		pending: make(map[string]statemachine.CommandResult),
 	}
 }
 
@@ -88,9 +89,9 @@ func (s *SingleNodeStub) Propose(ctx context.Context, data []byte) error {
 	// result for kvserver to pick up. Anything else (or a malformed
 	// request) just doesn't get a correlated result, which is fine for
 	// Put/Delete since their responses don't carry one.
-	var cmd command
+	var cmd statemachine.Command
 	if json.Unmarshal(data, &cmd) == nil && cmd.RequestID != "" {
-		var res commandResult
+		var res statemachine.CommandResult
 		if json.Unmarshal(result, &res) == nil {
 			s.pendingMu.Lock()
 			s.pending[cmd.RequestID] = res
@@ -104,7 +105,7 @@ func (s *SingleNodeStub) Propose(ctx context.Context, data []byte) error {
 // requestID by the Propose call above. Because Propose is fully
 // synchronous in this stub, the result is guaranteed to be present by the
 // time Propose returns.
-func (s *SingleNodeStub) takeResult(requestID string) (commandResult, bool) {
+func (s *SingleNodeStub) takeResult(requestID string) (statemachine.CommandResult, bool) {
 	s.pendingMu.Lock()
 	defer s.pendingMu.Unlock()
 	res, ok := s.pending[requestID]

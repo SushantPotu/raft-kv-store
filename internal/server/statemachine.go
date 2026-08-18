@@ -10,43 +10,9 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/SushantPotu/raft-kv-store/internal/statemachine"
 	"github.com/SushantPotu/raft-kv-store/pkg/raft"
 )
-
-// commandOp identifies which KVService operation a proposed log entry
-// encodes. Only this package needs to understand this wire format —
-// kvserver.go and stubnode.go both live here and agree on it directly, the
-// same way a real StateMachine adapter and its Raft Core caller would
-// agree on an application-defined encoding for entry.Data.
-type commandOp string
-
-const (
-	opPut commandOp = "put"
-	opDel commandOp = "delete"
-	opCAS commandOp = "cas"
-)
-
-// command is the payload proposed to raft.Node.Propose for every KVService
-// write. requestID lets the caller correlate a committed/applied entry
-// back to the client request that produced it (see fakeStateMachine.Apply
-// and stubnode.go for how that correlation is used).
-type command struct {
-	RequestID     string    `json:"request_id"`
-	Op            commandOp `json:"op"`
-	Key           []byte    `json:"key"`
-	Value         []byte    `json:"value,omitempty"`
-	ExpectedValue []byte    `json:"expected_value,omitempty"`
-	ExpectAbsent  bool      `json:"expect_absent,omitempty"`
-}
-
-// commandResult is what fakeStateMachine.Apply returns (JSON-encoded, as
-// the []byte result raft.StateMachine.Apply's signature allows) for a
-// given command. Put/Delete leave Swapped/ActualValue/Found unused.
-type commandResult struct {
-	Swapped     bool   `json:"swapped,omitempty"`
-	ActualValue []byte `json:"actual_value,omitempty"`
-	Found       bool   `json:"found,omitempty"`
-}
 
 // fakeStateMachine is a trivial in-memory raft.StateMachine used only by
 // Workstream C to prove out its own gRPC wiring end to end. It is NOT the
@@ -83,7 +49,7 @@ func (f *fakeStateMachine) Get(key []byte) (value []byte, found bool) {
 // and returns a JSON-encoded commandResult. This satisfies
 // raft.StateMachine.Apply.
 func (f *fakeStateMachine) Apply(entry raft.LogEntry) ([]byte, error) {
-	var cmd command
+	var cmd statemachine.Command
 	if err := json.Unmarshal(entry.Data, &cmd); err != nil {
 		return nil, fmt.Errorf("fakeStateMachine: decode command: %w", err)
 	}
@@ -91,13 +57,13 @@ func (f *fakeStateMachine) Apply(entry raft.LogEntry) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	var res commandResult
+	var res statemachine.CommandResult
 	switch cmd.Op {
-	case opPut:
+	case statemachine.OpPut:
 		f.data[string(cmd.Key)] = cmd.Value
-	case opDel:
+	case statemachine.OpDel:
 		delete(f.data, string(cmd.Key))
-	case opCAS:
+	case statemachine.OpCAS:
 		current, exists := f.data[string(cmd.Key)]
 		switch {
 		case cmd.ExpectAbsent:

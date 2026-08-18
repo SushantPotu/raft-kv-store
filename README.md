@@ -59,6 +59,12 @@ Requires Go 1.22+, Docker, and `buf` (for proto codegen). AWS deployment
 (`deploy/terraform/`) additionally requires the AWS CLI and configured
 credentials — see `deploy/terraform/envs/dev/README.md` once that's set up.
 
+`cmd/kvnode` (Integration Checkpoint 1) wires the storage engine, Raft
+core, and client/API layers into the real 3-node cluster `make compose-up`
+starts. See [`docs/runbooks/local-cluster.md`](docs/runbooks/local-cluster.md)
+for the full manual test: bring the cluster up, put/get a key, kill the
+leader, confirm a new one takes over and keeps accepting writes.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

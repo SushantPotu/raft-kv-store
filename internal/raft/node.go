@@ -40,10 +40,12 @@ const (
 	DefaultHeartbeatIntervalTicks  = 20
 )
 
-// ErrNotLeader is returned by Propose (and, once implemented,
-// ProposeConfChange/ReadIndex) when called on a node that doesn't
-// currently believe itself to be the leader.
-var ErrNotLeader = errors.New("raftcore: not the leader")
+// ErrNotLeader re-exports raft.ErrNotLeader for convenience within this
+// package (and for any caller that prefers importing raftcore over
+// pkg/raft for it) — it is the exact same sentinel, per raft.ErrNotLeader's
+// doc comment on why the canonical definition lives in pkg/raft instead of
+// here.
+var ErrNotLeader = raft.ErrNotLeader
 
 // Option configures optional Node behavior at construction time.
 type Option func(*Node)
