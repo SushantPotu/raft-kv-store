@@ -1,5 +1,8 @@
-# Placeholder until Workstream H lands cmd/metaservice/main.go.
-FROM golang:1.23 AS build
+# cmd/metaservice/main.go: the shard-map metadata service (see
+# internal/metaservice). Base image matches Dockerfile.kvnode's
+# golang:1.25 — go.mod's `go 1.25.0` directive requires a newer toolchain
+# than golang:1.23 (this file's original placeholder) ships.
+FROM golang:1.25 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
