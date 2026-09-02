@@ -45,6 +45,10 @@ func (n *Node) becomeFollowerLocked(term raft.Term, leader raft.NodeID) {
 		n.matchIndex = nil
 		n.appendInflight = nil
 		n.replicating = nil
+		// Any ReadIndex calls blocked waiting on this node's (now former)
+		// leadership can never be satisfied — fail them immediately rather
+		// than leaving the caller blocked until ctx expires.
+		n.failPendingReadsLocked(raft.ErrNotLeader)
 	}
 	n.resetElectionTimeoutLocked()
 }

@@ -62,12 +62,25 @@ func (n *Node) sendAppendEntriesToLocked(p raft.NodeID) {
 		next = 1
 	}
 	prevIdx := next - 1
+	// termAt(0) always trivially succeeds (index 0 is the "nothing before
+	// the log" sentinel — see its own doc comment in log.go), which is
+	// exactly wrong here for a peer whose nextIndex has never advanced
+	// past 1 (e.g. one that's been unreachable since before this node ever
+	// compacted anything): prevIdx==0 must still count as "compacted away"
+	// once the log's base has moved past it, so check that explicitly
+	// rather than relying solely on termAt's !ok.
+	if prevIdx < n.log.base {
+		n.sendInstallSnapshotToLocked(p)
+		return
+	}
 	prevTerm, ok := n.log.termAt(prevIdx)
 	if !ok {
-		// prevIdx has been compacted away. Snapshotting isn't implemented
-		// yet (see snapshot.go) so there's nothing better to do here; a
-		// real InstallSnapshot path would take over at this point.
-		prevTerm = 0
+		// prevIdx has been compacted away (it's before what raftLog/Storage
+		// still hold) — an AppendEntries can't bring this peer up to date
+		// from here at all, so send an InstallSnapshot instead (see
+		// snapshot.go's sendInstallSnapshotToLocked).
+		n.sendInstallSnapshotToLocked(p)
+		return
 	}
 	entries := n.log.entriesFrom(next)
 
@@ -112,6 +125,20 @@ func (n *Node) handleAppendEntriesLocked(from raft.NodeID, req *raftpb.AppendEnt
 		n.resetElectionTimeoutLocked()
 	}
 
+	if n.pendingSnapshot != nil {
+		// A previously received InstallSnapshot hasn't been drained via
+		// Ready/Advance yet (see snapshot.go's package doc comment on the
+		// Node/driver split of responsibility). Don't mutate the log any
+		// further until it has: cmd/kvnode's Ready-loop driver (and this
+		// package's own test harness) persists Entries *before* installing
+		// Snapshot, so a single Ready bundling both a Snapshot and Entries
+		// built on top of it would hand the driver a gap it can't apply.
+		// Silently drop this request; the leader will retry (it never gets
+		// a reply, so replicating[from] on the leader side simply stays
+		// set until the next forced heartbeat).
+		return
+	}
+
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose
 	// term matches prevLogTerm.
 	prevIdx := raft.LogIndex(req.PrevLogIndex)
@@ -133,6 +160,12 @@ func (n *Node) handleAppendEntriesLocked(from raft.NodeID, req *raftpb.AppendEnt
 	newEntries := fromPBEntries(req.Entries)
 	if len(newEntries) > 0 {
 		n.log.truncateAndAppend(newEntries)
+		// Recompute membership from scratch by replaying every
+		// EntryConfChange currently in the (possibly just-truncated) log
+		// over baselinePeers. This is what makes an uncommitted conf
+		// change correctly roll back if a new leader's log overwrites it —
+		// see the Node.baselinePeers doc comment in node.go.
+		n.recomputeConfigFromLogLocked()
 	}
 
 	// 5. Advance commitIndex, bounded by what we actually now have on
@@ -179,6 +212,10 @@ func (n *Node) handleAppendEntriesResponseLocked(from raft.NodeID, resp *raftpb.
 		return
 	}
 	n.replicating[from] = false
+	// Whether accepted or rejected, a same-term reply from `from` proves it
+	// still follows us as leader this term — that's exactly what a
+	// pending ReadIndex call (readindex.go) needs confirmed.
+	n.satisfyPendingReadsLocked(from)
 
 	if resp.Success {
 		if sentUpTo, ok := n.appendInflight[from]; ok && sentUpTo > n.matchIndex[from] {
@@ -225,27 +262,55 @@ func (n *Node) handleAppendEntriesResponseLocked(from raft.NodeID, resp *raftpb.
 // prevents a leader from committing (and thus exposing to clients) an
 // older-term entry via indirect replication counting alone.
 //
+// While a joint (C_old,new) configuration is in effect (n.joint != nil,
+// see membership.go), paper §6 requires condition (a) to hold
+// *independently* in both the old and the new configuration — candidate is
+// the minimum of the two per-config majority match indices, so an index
+// only counts as committed once both halves of the cluster have it.
+//
 // Must be called with n.mu held, and only while n.role == RoleLeader.
 func (n *Node) maybeAdvanceCommitLocked() {
 	if n.role != RoleLeader {
 		return
 	}
-	match := make([]raft.LogIndex, 0, len(n.peers)+1)
-	match = append(match, n.log.lastIndex()) // the leader always matches itself
-	for _, p := range n.peers {
-		match = append(match, n.matchIndex[p])
+	var candidate raft.LogIndex
+	if n.joint != nil {
+		candidate = n.majorityMatchLocked(n.joint.oldPeers)
+		if newC := n.majorityMatchLocked(n.joint.newPeers); newC < candidate {
+			candidate = newC
+		}
+	} else {
+		candidate = n.majorityMatchLocked(n.peers)
 	}
-	sort.Slice(match, func(i, j int) bool { return match[i] < match[j] })
-
-	majorityCount := len(match)/2 + 1
-	candidate := match[len(match)-majorityCount]
 	if candidate <= n.commitIndex {
 		return
 	}
 	if term, ok := n.log.termAt(candidate); ok && term == n.term {
 		n.commitIndex = candidate
 		n.hsDirty = true
+		n.promotePendingReadsLocked()
+		if n.joint != nil && n.confChangeIndex != 0 && n.commitIndex >= n.confChangeIndex {
+			// The joint entry just committed: paper §6 says it's now safe
+			// to move on to the final, new-only configuration.
+			n.transitionJointToFinalLocked()
+		}
 	}
+}
+
+// majorityMatchLocked returns the highest index a majority of {peers,
+// self} have replicated, per the usual "sort matchIndex, take the
+// majority-th" computation (paper §5.4.2) — factored out so
+// maybeAdvanceCommitLocked can apply it independently to each half of a
+// joint configuration.
+func (n *Node) majorityMatchLocked(peers []raft.NodeID) raft.LogIndex {
+	match := make([]raft.LogIndex, 0, len(peers)+1)
+	match = append(match, n.log.lastIndex()) // the leader always matches itself
+	for _, p := range peers {
+		match = append(match, n.matchIndex[p])
+	}
+	sort.Slice(match, func(i, j int) bool { return match[i] < match[j] })
+	majorityCount := len(match)/2 + 1
+	return match[len(match)-majorityCount]
 }
 
 func toPBEntries(entries []raft.LogEntry) []*raftpb.LogEntry {

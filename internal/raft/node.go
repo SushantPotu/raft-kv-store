@@ -19,7 +19,6 @@ package raftcore
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
@@ -78,6 +77,18 @@ func WithRandSource(r *rand.Rand) Option {
 	return func(n *Node) { n.rng = r }
 }
 
+// WithSnapshotThreshold overrides how many log entries (since the last
+// compaction) accumulate before Node automatically snapshots and compacts
+// its log (see snapshot.go's maybeSnapshotLocked). n <= 0 disables
+// automatic snapshotting entirely. Defaults to DefaultSnapshotThreshold.
+func WithSnapshotThreshold(n int) Option {
+	return func(node *Node) { node.snapshotThreshold = n }
+}
+
+// DefaultSnapshotThreshold is the default number of applied-but-not-yet-
+// compacted log entries that triggers an automatic snapshot.
+const DefaultSnapshotThreshold = 1000
+
 // Node implements raft.Node. All exported methods take n.mu, do their
 // work synchronously, and return — there are no goroutines and no
 // background timers anywhere in this type, per ADR 0001.
@@ -86,7 +97,47 @@ type Node struct {
 
 	id    raft.NodeID
 	shard raft.ShardID
-	peers []raft.NodeID // every other voting member; excludes id
+	// peers is the effective replication/voting target set: every other
+	// voting member currently in play, excluding id. Under normal
+	// operation this is a single static configuration; while a joint
+	// membership change is in flight (see membership.go) it is the union
+	// of the old and new configurations, so replication/heartbeats reach
+	// everyone whose ack might be needed, while joint (the non-nil
+	// jointConfig below) narrows majority/commit math back down to
+	// requiring both halves independently.
+	peers []raft.NodeID
+	// baselinePeers is the last known-good *single* configuration: either
+	// the constructor's peers argument (genesis) or whatever ConfState a
+	// snapshot most recently recorded. recomputeConfigFromLogLocked (called
+	// whenever entries arrive via AppendEntries) replays baselinePeers plus
+	// every EntryConfChange currently in the in-memory log to rebuild
+	// peers/joint from scratch, which is what makes an uncommitted conf
+	// change get correctly rolled back if a leader change truncates it away.
+	baselinePeers []raft.NodeID
+	// joint is non-nil exactly while a C_old,new joint configuration
+	// (paper §6) is in effect for this node.
+	joint *jointConfig
+	// confChangeIndex is the log index of the most recently observed
+	// EntryConfChange entry (whichever of this node's own ProposeConfChange
+	// calls, or one received via AppendEntries) currently governs the
+	// config. It serves two purposes: (1) ProposeConfChange refuses to
+	// start a new change while commitIndex hasn't yet reached it (Raft's
+	// usual "one configuration change at a time" discipline), and (2)
+	// while joint != nil, maybeAdvanceCommitLocked watches for commitIndex
+	// to reach it to know when it's safe to auto-propose the final C_new
+	// entry.
+	confChangeIndex raft.LogIndex
+
+	// snapshotThreshold and pendingSnapshot drive snapshot.go's
+	// compaction/InstallSnapshot logic; see maybeSnapshotLocked and
+	// handleInstallSnapshotLocked.
+	snapshotThreshold int
+	pendingSnapshot   *raft.Snapshot
+	outSnapshotPosted bool
+
+	// pendingReads holds every in-flight ReadIndex call this Node (as
+	// leader) hasn't yet resolved; see readindex.go.
+	pendingReads []*pendingReadIndex
 
 	storage raft.Storage
 	// transport is stored only for API-shape parity with how
@@ -155,6 +206,7 @@ func NewNode(id raft.NodeID, shard raft.ShardID, peers []raft.NodeID, storage ra
 		id:                 id,
 		shard:              shard,
 		peers:              append([]raft.NodeID(nil), peers...),
+		baselinePeers:      append([]raft.NodeID(nil), peers...),
 		storage:            storage,
 		transport:          transport,
 		sm:                 sm,
@@ -162,6 +214,7 @@ func NewNode(id raft.NodeID, shard raft.ShardID, peers []raft.NodeID, storage ra
 		electionTimeoutMin: DefaultElectionTimeoutMinTicks,
 		electionTimeoutMax: DefaultElectionTimeoutMaxTicks,
 		heartbeatInterval:  DefaultHeartbeatIntervalTicks,
+		snapshotThreshold:  DefaultSnapshotThreshold,
 	}
 	for _, opt := range opts {
 		opt(n)
@@ -170,12 +223,37 @@ func NewNode(id raft.NodeID, shard raft.ShardID, peers []raft.NodeID, storage ra
 		n.rng = rand.New(rand.NewSource(defaultSeedFor(id)))
 	}
 
-	if hs, _, err := storage.InitialState(); err == nil {
+	if hs, cs, err := storage.InitialState(); err == nil {
 		n.term = hs.Term
 		n.votedFor = hs.VotedFor
 		n.commitIndex = hs.CommitIdx
+		if len(cs.Voters) > 0 {
+			// A prior snapshot recorded membership; it supersedes the
+			// constructor's peers argument (which only matters as the
+			// genesis config for a brand-new cluster).
+			n.baselinePeers = removeSelf(cs.Voters, id)
+			n.peers = append([]raft.NodeID(nil), n.baselinePeers...)
+		}
 	}
 	n.log = newRaftLog(storage)
+	// Anything at or before the log's base (0 unless storage already held
+	// a snapshot at construction time — i.e. this is a restart, not a
+	// brand-new node) is, by definition of what a snapshot is, already
+	// reflected in the state machine: the caller is expected to have
+	// restored it from durable storage of its own (see snapshot.go's
+	// package doc comment on Storage/StateMachine persistence being the
+	// caller's responsibility, same as for a *received* InstallSnapshot).
+	// Starting appliedIndex at 0 regardless of that would make the very
+	// first Ready() re-deliver entries already baked into that restored
+	// state as CommittedEntries, double-applying them.
+	if n.log.base > n.appliedIndex {
+		n.appliedIndex = n.log.base
+	}
+	// Replay any EntryConfChange entries already sitting in the recovered
+	// log on top of baselinePeers, so a restart resumes with the right
+	// membership (including an in-flight joint config, if one was never
+	// finalized before the crash).
+	n.recomputeConfigFromLogLocked()
 	n.resetElectionTimeoutLocked()
 
 	return n
@@ -220,16 +298,18 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// ProposeConfChange is not implemented yet: dynamic membership changes via
-// joint consensus are a separate, later workstream (see membership.go).
+// ProposeConfChange implements dynamic membership changes via joint
+// consensus (paper §6); see membership.go for the full implementation.
 func (n *Node) ProposeConfChange(ctx context.Context, cc raft.ConfChange) error {
-	return errors.New("raftcore: ProposeConfChange not yet implemented (membership changes are a later workstream, see membership.go)")
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.proposeConfChangeLocked(cc)
 }
 
-// ReadIndex is not implemented yet: the linearizable-read protocol is a
-// separate, later workstream (see readindex.go).
+// ReadIndex implements the linearizable-read protocol (paper §8); see
+// readindex.go for the full implementation.
 func (n *Node) ReadIndex(ctx context.Context, ctxToken []byte) error {
-	return errors.New("raftcore: ReadIndex not yet implemented (linearizable reads are a later workstream, see readindex.go)")
+	return n.readIndex(ctx, ctxToken)
 }
 
 // Step feeds one inbound RPC (or RPC reply — see the package-level note in
@@ -259,7 +339,14 @@ func (n *Node) Step(ctx context.Context, msg raft.InboundMessage) error {
 			return fmt.Errorf("raftcore: MsgAppendEntries with unexpected payload type %T", msg.Payload)
 		}
 	case raft.MsgInstallSnapshot:
-		return errors.New("raftcore: InstallSnapshot not yet implemented (snapshotting is a later workstream, see snapshot.go)")
+		switch p := msg.Payload.(type) {
+		case *raftpb.InstallSnapshotChunk:
+			n.handleInstallSnapshotLocked(msg.From, p)
+		case *raftpb.InstallSnapshotResponse:
+			n.handleInstallSnapshotResponseLocked(msg.From, p)
+		default:
+			return fmt.Errorf("raftcore: MsgInstallSnapshot with unexpected payload type %T", msg.Payload)
+		}
 	default:
 		return fmt.Errorf("raftcore: unknown message kind %v", msg.Kind)
 	}
@@ -349,6 +436,17 @@ func (n *Node) Ready() <-chan raft.Ready {
 		haveWork = true
 	}
 
+	// A snapshot was just installed via Step (handleInstallSnapshotLocked):
+	// surface it so the Ready-loop driver actually persists it
+	// (Storage.ApplySnapshot) and restores the state machine
+	// (StateMachine.RestoreSnapshot) — see that function's doc comment for
+	// the full contract on who's responsible for what.
+	if n.pendingSnapshot != nil {
+		rd.Snapshot = n.pendingSnapshot
+		n.outSnapshotPosted = true
+		haveWork = true
+	}
+
 	if haveWork {
 		n.readyOutstanding = true
 		ch <- rd
@@ -373,10 +471,20 @@ func (n *Node) Advance() {
 	if n.outHardStatePosted {
 		n.hsDirty = false
 	}
+	if n.outSnapshotPosted {
+		n.pendingSnapshot = nil
+		n.outSnapshotPosted = false
+	}
 	n.readyOutstanding = false
 	n.outEntriesUpTo = 0
 	n.outCommittedUpTo = 0
 	n.outHardStatePosted = false
+
+	// Once the caller has (per the Advance contract) fully processed this
+	// Ready — including applying CommittedEntries to the state machine —
+	// it's safe to snapshot at the new appliedIndex, since Snapshot() below
+	// will reflect that application.
+	n.maybeSnapshotLocked()
 }
 
 // Status returns a read-only snapshot of this Node's current view.
