@@ -24,6 +24,11 @@ crash.*.log
 *.wal
 *.log
 
+# cmd/chaosmonkey's default output path; docs/benchmarks/*.csv snapshots
+# of past runs are intentionally tracked, so this only ignores the
+# tool's default filename at the repo root.
+/chaos-results.csv
+
 # IDE
 .idea/
 .vscode/
