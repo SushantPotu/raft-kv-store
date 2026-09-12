@@ -143,8 +143,8 @@ func RunTrials(ctx context.Context, newCluster Factory, nodes, n int) ([]Result,
 
 // Stats summarizes a set of failover durations.
 type Stats struct {
-	Count      int
-	Min, Max   time.Duration
+	Count         int
+	Min, Max      time.Duration
 	P50, P90, P99 time.Duration
 }
 

@@ -240,7 +240,10 @@ func runMultiShard() error {
 
 	// Peer-facing RaftTransportService: one shared server dispatching by
 	// shard_id via registry, exactly like the single-shard path.
-	peerSrv := grpc.NewServer()
+	peerSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize),
+		grpc.MaxSendMsgSize(grpctransport.MaxMessageSize),
+	)
 	raftpb.RegisterRaftTransportServiceServer(peerSrv, grpctransport.NewServer(registry))
 	peerLis, err := net.Listen("tcp", peerListenAddr)
 	if err != nil {

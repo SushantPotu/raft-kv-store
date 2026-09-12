@@ -39,13 +39,36 @@ type Client struct {
 
 var _ raft.Transport = (*Client)(nil)
 
+// MaxMessageSize overrides gRPC's default 4MiB send/receive cap for every
+// peer connection this package dials or serves (see NewClient below and
+// each cmd/*'s peer grpc.Server construction, which must pass the
+// matching grpc.MaxRecvMsgSize/grpc.MaxSendMsgSize server options). A
+// single-chunk InstallSnapshot transfer (see internal/raft/snapshot.go's
+// doc comment on why it isn't actually split into multiple chunks yet)
+// carries the *entire* state machine's serialized keyspace in one
+// message; under real write volume that routinely exceeds 4MiB long
+// before it's a genuinely large deployment, and a rejected chunk isn't
+// retried with a smaller size — it just fails outright, repeatedly,
+// until nextIndex happens to require a fresh attempt. 64MiB buys
+// meaningful headroom for a portfolio-scale cluster without pretending
+// to solve unbounded snapshot size, which real chunking (not attempted
+// here — see snapshot.go) is the actual fix for.
+const MaxMessageSize = 64 << 20 // 64MiB
+
 // NewClient constructs a Client. dialOpts are applied to every peer
 // connection Client dials lazily (e.g. grpc.WithTransportCredentials);
 // callers must supply transport credentials themselves — Client has no
-// opinion on TLS vs. insecure.
+// opinion on TLS vs. insecure. MaxMessageSize's send/receive limits are
+// applied automatically on top of whatever dialOpts the caller passes.
 func NewClient(dialOpts ...grpc.DialOption) *Client {
+	opts := append([]grpc.DialOption{
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(MaxMessageSize),
+			grpc.MaxCallSendMsgSize(MaxMessageSize),
+		),
+	}, dialOpts...)
 	return &Client{
-		dialOpts: dialOpts,
+		dialOpts: opts,
 		conns:    make(map[raft.NodeID]*grpc.ClientConn),
 		addrs:    make(map[raft.NodeID]string),
 	}

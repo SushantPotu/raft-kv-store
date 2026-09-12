@@ -248,7 +248,10 @@ func (c *Cluster) buildNode(id raft.NodeID, peerPort, clientPort int) (*node, er
 		xport.Close()
 		return nil, fmt.Errorf("listen peer addr: %w", err)
 	}
-	peerSrv := grpc.NewServer()
+	peerSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize),
+		grpc.MaxSendMsgSize(grpctransport.MaxMessageSize),
+	)
 	raftpb.RegisterRaftTransportServiceServer(peerSrv, grpctransport.NewServer(registry))
 	go func() { _ = peerSrv.Serve(peerLis) }()
 
