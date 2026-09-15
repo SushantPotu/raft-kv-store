@@ -2,6 +2,7 @@ package raftcore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -31,8 +32,25 @@ func (f *fakeStateMachine) Apply(entry raft.LogEntry) ([]byte, error) {
 	return nil, nil
 }
 
-func (f *fakeStateMachine) Snapshot() ([]byte, error)         { return nil, nil }
-func (f *fakeStateMachine) RestoreSnapshot(data []byte) error { return nil }
+// Snapshot/RestoreSnapshot round-trip the full applied-commands slice as
+// JSON, so snapshot tests can actually verify state survives a
+// compact-then-InstallSnapshot (or restart-from-snapshot) cycle, rather
+// than just checking Storage-level bookkeeping.
+func (f *fakeStateMachine) Snapshot() ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return json.Marshal(f.applied)
+}
+
+func (f *fakeStateMachine) RestoreSnapshot(data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(data) == 0 {
+		f.applied = nil
+		return nil
+	}
+	return json.Unmarshal(data, &f.applied)
+}
 
 func (f *fakeStateMachine) commands() []string {
 	f.mu.Lock()
@@ -167,6 +185,18 @@ func (h *testHarness) drainAll() {
 			for _, m := range rd.Messages {
 				h.network.Send(id, m.To, h.shard, m)
 			}
+			if rd.Snapshot != nil {
+				// Mirrors cmd/kvnode's handleReady: Node itself never calls
+				// ApplySnapshot/RestoreSnapshot for a *received* snapshot —
+				// that's the Ready-loop driver's job, which this harness
+				// plays here.
+				if err := st.ApplySnapshot(*rd.Snapshot); err != nil {
+					h.t.Fatalf("node %s: Storage.ApplySnapshot: %v", id, err)
+				}
+				if err := h.sms[id].RestoreSnapshot(rd.Snapshot.Data); err != nil {
+					h.t.Fatalf("node %s: StateMachine.RestoreSnapshot: %v", id, err)
+				}
+			}
 			node.Advance()
 		default:
 		}
@@ -227,6 +257,27 @@ func (h *testHarness) kill(id raft.NodeID) {
 func (h *testHarness) restart(id raft.NodeID) {
 	delete(h.killed, id)
 	h.cluster.Restart(id)
+}
+
+// addNode dynamically adds a new node to a running harness, mid-test — used
+// by membership-change tests to bring up a replica beyond the harness's
+// initial fixed set. peers lists every other voting member the new node
+// should start out knowing about, from its own perspective (excluding
+// itself); it doesn't need to already match every existing node's view,
+// since AppendEntries will bring it into agreement once a leader replicates
+// to it.
+func (h *testHarness) addNode(id raft.NodeID, peers []raft.NodeID, seed int64, opts ...Option) raft.Node {
+	st := rafttest.NewFakeStorage()
+	sm := newFakeStateMachine()
+	nodeOpts := append([]Option{WithRandSource(rand.New(rand.NewSource(seed)))}, opts...)
+	node := NewNode(id, h.shard, peers, st, nil, sm, nodeOpts...)
+
+	h.ids = append(h.ids, id)
+	h.storage[id] = st
+	h.sms[id] = sm
+	h.nodes[id] = node
+	h.cluster.AddNode(id, node)
+	return node
 }
 
 // alive returns every node id that hasn't been killed.

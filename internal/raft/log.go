@@ -139,6 +139,41 @@ func (l *raftLog) unstableEntries() []raft.LogEntry {
 	return l.entriesFrom(l.stableIndex + 1)
 }
 
+// compactTo drops every entry with Index <= idx (they remain available
+// only via a Snapshot from here on) and records idx/term as the new base,
+// per the same bookkeeping newRaftLog uses for entries recovered from
+// Storage after a restart. Used after a successful Storage.CreateSnapshot
+// (see snapshot.go's maybeSnapshotLocked). idx must be <= lastIndex(); a
+// no-op if idx is already <= the current base.
+func (l *raftLog) compactTo(idx raft.LogIndex, term raft.Term) {
+	if idx <= l.base {
+		return
+	}
+	if idx >= l.lastIndex() {
+		l.entries = nil
+	} else {
+		l.entries = l.entries[idx-l.base:]
+	}
+	l.base = idx
+	l.baseTerm = term
+	if l.stableIndex < idx {
+		l.stableIndex = idx
+	}
+}
+
+// resetToSnapshot unconditionally replaces the entire in-memory log view
+// with a fresh snapshot boundary, discarding any existing entries even if
+// they conflict with it. Used when installing a snapshot received via
+// InstallSnapshot (see snapshot.go's handleInstallSnapshotLocked), which —
+// unlike the leader's own proactive compaction via compactTo — may need to
+// blow away a follower's entire (possibly wildly stale or conflicting) log.
+func (l *raftLog) resetToSnapshot(idx raft.LogIndex, term raft.Term) {
+	l.entries = nil
+	l.base = idx
+	l.baseTerm = term
+	l.stableIndex = idx
+}
+
 // isUpToDate implements the RequestVote "at least as up-to-date" check
 // (paper §5.4.1): compare last log term first, then last log index.
 func (l *raftLog) isUpToDate(lastIdx raft.LogIndex, lastTerm raft.Term) bool {

@@ -98,14 +98,35 @@ func (n *Node) handleRequestVoteResponseLocked(from raft.NodeID, resp *raftpb.Re
 		return
 	}
 	n.votesGranted[from] = true
-	if n.hasMajorityLocked(len(n.votesGranted)) {
+	if n.hasMajorityLocked(n.votesGranted) {
 		n.becomeLeaderLocked()
 	}
 }
 
-// hasMajorityLocked reports whether count is a majority of the full
-// (peers + self) cluster size.
-func (n *Node) hasMajorityLocked(count int) bool {
-	total := len(n.peers) + 1
+// hasMajorityLocked reports whether votes (keyed by voter NodeID, true =
+// granted) constitutes a majority. Under a normal single configuration
+// that's a majority of n.peers+self; while a joint (paper §6) membership
+// change is in flight, it requires an *independent* majority in both the
+// old and the new configuration (quorumReached is evaluated twice) — see
+// membership.go's jointConfig.
+func (n *Node) hasMajorityLocked(votes map[raft.NodeID]bool) bool {
+	if n.joint != nil {
+		return quorumReached(votes, n.joint.oldPeers, n.id) && quorumReached(votes, n.joint.newPeers, n.id)
+	}
+	return quorumReached(votes, n.peers, n.id)
+}
+
+// quorumReached reports whether votes contains a majority of peers+self.
+func quorumReached(votes map[raft.NodeID]bool, peers []raft.NodeID, self raft.NodeID) bool {
+	total := len(peers) + 1
+	count := 0
+	if votes[self] {
+		count++
+	}
+	for _, p := range peers {
+		if votes[p] {
+			count++
+		}
+	}
 	return count*2 > total
 }
