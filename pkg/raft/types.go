@@ -160,7 +160,15 @@ type Message struct {
 	Shard   ShardID
 	Kind    MessageKind
 	Term    Term
-	Payload any // one of *raftpb.RequestVoteRequest, *raftpb.AppendEntriesRequest, *raftpb.InstallSnapshotRequest
+	// Payload is one of *raftpb.RequestVoteRequest, *raftpb.AppendEntriesRequest,
+	// *raftpb.InstallSnapshotRequest — OR the corresponding *Response type.
+	// Both requests and responses flow through this same Message/Step
+	// plumbing (there is no separate response path — see
+	// internal/raft/simulate.Cluster.drainReady, which relays Ready.Messages
+	// straight into the destination's Step either way). Node implementations
+	// disambiguate by the concrete Go type of Payload, not by MessageKind
+	// alone, since MessageKind only names the RPC, not the direction.
+	Payload any
 }
 
 type MessageKind int
@@ -204,10 +212,12 @@ type Node interface {
 }
 
 // InboundMessage is a received RPC translated into Node's internal
-// vocabulary by internal/transport/grpc before calling Step.
+// vocabulary by internal/transport/grpc before calling Step. As with
+// Message.Payload above, this can be either a request or a response type —
+// a Node receives peers' responses via Step too, not just their requests.
 type InboundMessage struct {
 	From    NodeID
 	Shard   ShardID
 	Kind    MessageKind
-	Payload any // one of *raftpb.RequestVoteRequest, *raftpb.AppendEntriesRequest, *raftpb.InstallSnapshotRequest
+	Payload any
 }
