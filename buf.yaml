@@ -11,6 +11,12 @@ lint:
     # That deliberately doesn't mirror the proto package path (raft.v1 ->
     # raft/v1), which is what this rule checks for.
     - PACKAGE_DIRECTORY_MATCH
+    # RaftMessage and InstallSnapshotChunk are deliberately named for what
+    # they contain (a generic envelope; a snapshot data chunk), not for the
+    # RPC that happens to carry them — RaftTransportServiceSendRequest
+    # would be a worse name for a type meant to be understood on its own.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
 breaking:
   use:
     - FILE

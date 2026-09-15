@@ -165,12 +165,21 @@ func (r *Registry) Register(id raft.NodeID, node raft.Node) {
 	r.handlers[id] = node
 }
 
+// FakeTransport delivers a Message directly to the target's Step, entirely
+// in-process — no serialization, no gRPC. self identifies which node this
+// particular FakeTransport instance sends on behalf of, so the delivered
+// InboundMessage.From is correct: unlike a real network connection, an
+// in-process call has no inherent notion of "who's calling," so it has to
+// be supplied explicitly.
 type FakeTransport struct {
+	self     raft.NodeID
 	registry *Registry
 }
 
-func NewFakeTransport(registry *Registry) *FakeTransport {
-	return &FakeTransport{registry: registry}
+// NewFakeTransport constructs a transport that sends as self, resolving
+// targets through registry.
+func NewFakeTransport(self raft.NodeID, registry *Registry) *FakeTransport {
+	return &FakeTransport{self: self, registry: registry}
 }
 
 func (t *FakeTransport) target(id raft.NodeID) (raft.Node, error) {
@@ -183,35 +192,25 @@ func (t *FakeTransport) target(id raft.NodeID) (raft.Node, error) {
 	return n, nil
 }
 
-func (t *FakeTransport) SendRequestVote(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	n, err := t.target(target)
+// Send implements raft.Transport.
+func (t *FakeTransport) Send(ctx context.Context, msg raft.Message) error {
+	n, err := t.target(msg.To)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := n.Step(ctx, raft.InboundMessage{Shard: shard, Kind: raft.MsgRequestVote, Payload: req}); err != nil {
-		return nil, err
-	}
-	return &raftpb.RequestVoteResponse{}, nil
+	return n.Step(ctx, raft.InboundMessage{
+		From:    t.self,
+		Shard:   msg.Shard,
+		Kind:    msg.Kind,
+		Payload: msg.Payload,
+	})
 }
 
-func (t *FakeTransport) SendAppendEntries(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
+// SendInstallSnapshotChunk implements raft.Transport.
+func (t *FakeTransport) SendInstallSnapshotChunk(ctx context.Context, shard raft.ShardID, target raft.NodeID, chunk *raftpb.InstallSnapshotChunk) error {
 	n, err := t.target(target)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := n.Step(ctx, raft.InboundMessage{Shard: shard, Kind: raft.MsgAppendEntries, Payload: req}); err != nil {
-		return nil, err
-	}
-	return &raftpb.AppendEntriesResponse{}, nil
-}
-
-func (t *FakeTransport) SendInstallSnapshot(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
-	n, err := t.target(target)
-	if err != nil {
-		return nil, err
-	}
-	if err := n.Step(ctx, raft.InboundMessage{Shard: shard, Kind: raft.MsgInstallSnapshot, Payload: req}); err != nil {
-		return nil, err
-	}
-	return &raftpb.InstallSnapshotResponse{}, nil
+	return n.Step(ctx, raft.InboundMessage{From: t.self, Shard: shard, Kind: raft.MsgInstallSnapshot, Payload: chunk})
 }

@@ -34,7 +34,6 @@ func (n *Node) startElectionLocked() {
 	lastTerm, _ := n.log.termAt(lastIdx)
 	for _, p := range n.peers {
 		n.send(p, raft.MsgRequestVote, &raftpb.RequestVoteRequest{
-			ShardId:      string(n.shard),
 			Term:         uint64(n.term),
 			CandidateId:  string(n.id),
 			LastLogIndex: uint64(lastIdx),
@@ -76,6 +75,7 @@ func (n *Node) handleRequestVoteLocked(from raft.NodeID, req *raftpb.RequestVote
 	}
 
 	n.send(from, raft.MsgRequestVote, &raftpb.RequestVoteResponse{
+		VoterId:     string(n.id),
 		Term:        uint64(n.term),
 		VoteGranted: grant,
 	})

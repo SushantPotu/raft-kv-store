@@ -95,60 +95,71 @@ func (c *Client) clientFor(target raft.NodeID) (raftpb.RaftTransportServiceClien
 	return raftpb.NewRaftTransportServiceClient(conn), nil
 }
 
-// SendRequestVote implements raft.Transport.
-func (c *Client) SendRequestVote(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.RequestVoteRequest) (*raftpb.RequestVoteResponse, error) {
-	cli, err := c.clientFor(target)
+// Send implements raft.Transport. It wraps msg.Payload in a RaftMessage
+// envelope (see proto/raftpb/raft.proto's design note) and fires it at
+// msg.To as a single RPC. The call's own return carries no Raft-protocol
+// information — per raft.Transport.Send's doc comment, the real reply (if
+// msg was a request) arrives later as its own separate Send call in the
+// other direction.
+func (c *Client) Send(ctx context.Context, msg raft.Message) error {
+	cli, err := c.clientFor(msg.To)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	req.ShardId = string(shard)
-	return cli.RequestVote(ctx, req)
+
+	envelope := &raftpb.RaftMessage{ShardId: string(msg.Shard)}
+	switch p := msg.Payload.(type) {
+	case *raftpb.RequestVoteRequest:
+		envelope.Body = &raftpb.RaftMessage_RequestVoteRequest{RequestVoteRequest: p}
+	case *raftpb.RequestVoteResponse:
+		envelope.Body = &raftpb.RaftMessage_RequestVoteResponse{RequestVoteResponse: p}
+	case *raftpb.AppendEntriesRequest:
+		envelope.Body = &raftpb.RaftMessage_AppendEntriesRequest{AppendEntriesRequest: p}
+	case *raftpb.AppendEntriesResponse:
+		envelope.Body = &raftpb.RaftMessage_AppendEntriesResponse{AppendEntriesResponse: p}
+	case *raftpb.InstallSnapshotResponse:
+		envelope.Body = &raftpb.RaftMessage_InstallSnapshotResponse{InstallSnapshotResponse: p}
+	default:
+		return fmt.Errorf("grpctransport: unsupported message payload type %T", msg.Payload)
+	}
+
+	_, err = cli.Send(ctx, envelope)
+	return err
 }
 
-// SendAppendEntries implements raft.Transport.
-func (c *Client) SendAppendEntries(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.AppendEntriesRequest) (*raftpb.AppendEntriesResponse, error) {
-	cli, err := c.clientFor(target)
-	if err != nil {
-		return nil, err
-	}
-	req.ShardId = string(shard)
-	return cli.AppendEntries(ctx, req)
-}
-
-// SendInstallSnapshot implements raft.Transport. Unlike RequestVote/
-// AppendEntries, the wire RPC (RaftTransportService.InstallSnapshot) is
-// client-streaming, because a full-keyspace snapshot can be too large for
-// one message. But raft.Transport's method signature is unary — it takes
-// and returns exactly one chunk — so each SendInstallSnapshot call here
-// opens its own short-lived stream, sends the single chunk it was given,
-// and immediately closes the send side and waits for the response.
+// SendInstallSnapshotChunk implements raft.Transport. The wire RPC
+// (RaftTransportService.InstallSnapshot) is client-streaming, because a
+// full-keyspace snapshot can be too large for one message — but this
+// method's own signature is per-chunk, so each call here opens its own
+// short-lived stream, sends the single chunk it was given, and immediately
+// closes the send side.
 //
-// Tradeoff: a Raft Core caller sending a multi-chunk snapshot (repeated
-// SendInstallSnapshot calls with offset/done fields tracking progress,
-// per the proto's field comments) pays a new-stream setup cost per chunk
-// instead of reusing one stream for the whole snapshot. That's an
-// acceptable simplification for Checkpoint 1 — keeping this Transport
-// implementation's shape a straightforward mirror of the other two
-// methods matters more right now than optimizing a path (snapshot
-// transfer) that isn't yet exercised by any real caller. Revisit if/when
-// snapshot transfer performance actually matters.
-func (c *Client) SendInstallSnapshot(ctx context.Context, shard raft.ShardID, target raft.NodeID, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
+// Tradeoff: a caller sending a multi-chunk snapshot (repeated
+// SendInstallSnapshotChunk calls with offset/done fields tracking
+// progress, per the proto's field comments) pays a new-stream setup cost
+// per chunk instead of reusing one stream for the whole snapshot. That's
+// an acceptable simplification for Checkpoint 1 — snapshotting isn't
+// exercised by any real caller yet (Workstream E). Revisit if/when
+// snapshot transfer performance actually matters. The stream's own
+// completion value is discarded for the same reason Send's is: the real
+// InstallSnapshotResponse travels back via a later Send call, not this
+// RPC's return.
+func (c *Client) SendInstallSnapshotChunk(ctx context.Context, shard raft.ShardID, target raft.NodeID, chunk *raftpb.InstallSnapshotChunk) error {
 	cli, err := c.clientFor(target)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	req.ShardId = string(shard)
+	chunk.ShardId = string(shard)
 
 	stream, err := cli.InstallSnapshot(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("grpctransport: open InstallSnapshot stream to %q: %w", target, err)
+		return fmt.Errorf("grpctransport: open InstallSnapshot stream to %q: %w", target, err)
 	}
-	if err := stream.Send(req); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("grpctransport: send InstallSnapshot chunk to %q: %w", target, err)
+	if err := stream.Send(chunk); err != nil && err != io.EOF {
+		return fmt.Errorf("grpctransport: send InstallSnapshot chunk to %q: %w", target, err)
 	}
-	resp, err := stream.CloseAndRecv()
-	if err != nil {
-		return nil, fmt.Errorf("grpctransport: recv InstallSnapshot response from %q: %w", target, err)
+	if _, err := stream.CloseAndRecv(); err != nil {
+		return fmt.Errorf("grpctransport: close InstallSnapshot stream to %q: %w", target, err)
 	}
-	return resp, nil
+	return nil
 }
