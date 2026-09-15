@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package kv.v1;
+
+option go_package = "github.com/SushantPotu/raft-kv-store/pkg/kvpb;kvpb";
+
+// KV is the client-facing API, served by kvnode directly (single-shard /
+// local testing) or fronted by kvrouter (multi-shard). Every request
+// carries shard_id once sharding is in play; kvrouter fills it in after a
+// metaservice lookup, so a direct-to-kvnode client only needs it in the
+// multi-shard case.
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc CompareAndSwap(CompareAndSwapRequest) returns (CompareAndSwapResponse);
+}
+
+enum Consistency {
+  CONSISTENCY_UNSPECIFIED = 0;
+  // Goes through Node.ReadIndex(): leader confirms leadership via a
+  // majority heartbeat round before serving the read. Never stale.
+  CONSISTENCY_LINEARIZABLE = 1;
+  // Served from local state on whatever replica received the request.
+  // May be stale on a partitioned or lagging follower — documented
+  // tradeoff, not a bug.
+  CONSISTENCY_STALE = 2;
+}
+
+message GetRequest {
+  string shard_id = 1;
+  bytes key = 2;
+  Consistency consistency = 3;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool found = 2;
+  // Set when this node is not the shard's leader and the request required
+  // leader-only handling (e.g. LINEARIZABLE reads, or any write below).
+  // Empty otherwise.
+  string leader_hint = 3;
+}
+
+message PutRequest {
+  string shard_id = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message PutResponse {
+  string leader_hint = 1;
+}
+
+message DeleteRequest {
+  string shard_id = 1;
+  bytes key = 2;
+}
+
+message DeleteResponse {
+  string leader_hint = 1;
+}
+
+message CompareAndSwapRequest {
+  string shard_id = 1;
+  bytes key = 2;
+  bytes expected_value = 3;
+  bool expect_absent = 4; // true means "only set if key does not currently exist"
+  bytes new_value = 5;
+}
+
+message CompareAndSwapResponse {
+  bool swapped = 1;
+  bytes actual_value = 2;
+  string leader_hint = 3;
+}

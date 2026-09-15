@@ -1,0 +1,17 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+
+issues:
+  exclude-dirs:
+    - pkg/raftpb
+    - pkg/kvpb
+    - pkg/metapb
