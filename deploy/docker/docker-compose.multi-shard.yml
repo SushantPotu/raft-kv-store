@@ -1,0 +1,97 @@
+# Round 2 (Multi-Raft Sharding & Routing) rehearsal: 2 shards x 3 replicas,
+# fronted by kvrouter and backed by metaservice — the multi-shard sibling
+# of docker-compose.yml's single-shard 3-node cluster.
+#
+# Topology: kvnode-1/2/3 are three physical processes, each hosting a
+# replica of BOTH shard-1 and shard-2 (internal/shard.Manager) — the same
+# "same physical nodes host every shard" layout
+# deploy/terraform/modules/cloudmap/main.tf's per-shard Cloud Map service
+# comment describes for production. Key ranges (shard-1: [..., "m"),
+# shard-2: ["m", ...)) are seeded into metaservice at startup via
+# SHARD_SEEDS (hex "6d" is ASCII 'm') — see cmd/metaservice's doc comment
+# for why that's a local-rehearsal convenience rather than how production
+# would do it (seeding DynamoDB directly, before any kvnode starts).
+#
+# `docker compose -f deploy/docker/docker-compose.multi-shard.yml config`
+# should validate today; `docker compose ... up` additionally needs a
+# working Docker daemon, which isn't reliably available in every
+# environment — the same bar Checkpoint 1's docker-compose.yml was held to.
+name: raft-kv-store-multi-shard
+
+services:
+  metaservice:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.metaservice
+    container_name: metaservice
+    environment:
+      - LISTEN_ADDR=:9200
+      - "SHARD_SEEDS=shard-1::6d,shard-2:6d:"
+    ports:
+      - "9200:9200"
+    networks: [raftnet]
+
+  kvnode-1:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-1
+    environment:
+      - NODE_ID=kvnode-1
+      - SHARD_IDS=shard-1,shard-2
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+      - METASERVICE_ADDR=metaservice:9200
+      - ADVERTISE_ADDR=kvnode-1:9001
+    ports:
+      - "9001:9001" # client-facing KV gRPC (direct-to-replica, mainly for debugging — clients should go through kvrouter)
+    depends_on: [metaservice]
+    networks: [raftnet]
+
+  kvnode-2:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-2
+    environment:
+      - NODE_ID=kvnode-2
+      - SHARD_IDS=shard-1,shard-2
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+      - METASERVICE_ADDR=metaservice:9200
+      - ADVERTISE_ADDR=kvnode-2:9001
+    ports:
+      - "9002:9001"
+    depends_on: [metaservice]
+    networks: [raftnet]
+
+  kvnode-3:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvnode
+    container_name: kvnode-3
+    environment:
+      - NODE_ID=kvnode-3
+      - SHARD_IDS=shard-1,shard-2
+      - PEERS=kvnode-1=kvnode-1:9000,kvnode-2=kvnode-2:9000,kvnode-3=kvnode-3:9000
+      - METASERVICE_ADDR=metaservice:9200
+      - ADVERTISE_ADDR=kvnode-3:9001
+    ports:
+      - "9003:9001"
+    depends_on: [metaservice]
+    networks: [raftnet]
+
+  kvrouter:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.kvrouter
+    container_name: kvrouter
+    environment:
+      - LISTEN_ADDR=:9100
+      - METASERVICE_ADDR=metaservice:9200
+    ports:
+      - "9100:9100" # client-facing KV gRPC — the intended entry point for multi-shard clients
+    depends_on: [metaservice, kvnode-1, kvnode-2, kvnode-3]
+    networks: [raftnet]
+
+networks:
+  raftnet:
+    driver: bridge

@@ -19,6 +19,21 @@
 // Peer-RPC (RaftTransportService) listens on :9000; client-facing
 // (KVService) listens on :9001, matching Dockerfile.kvnode's EXPOSE and
 // docker-compose.yml's port mappings.
+//
+// # Multi-Raft sharding (Round 2)
+//
+// This same binary also supports hosting multiple shards in one process
+// (internal/shard.Manager) — see multishard.go. It is opt-in, selected by
+// setting SHARD_IDS (comma-separated) instead of the single-shard SHARD_ID
+// var, specifically so the existing single-shard docker-compose.yml /
+// Checkpoint-1 setup keeps working completely unmodified: main() below
+// dispatches on which env var is present before touching anything else,
+// and the single-shard code path in this file (run, runReadyLoop,
+// handleReady, config, parsePeers) is untouched by that addition. See
+// multishard.go's doc comment for the additional env vars
+// (SHARD_IDS/ADVERTISE_ADDR/METASERVICE_ADDR/AVAILABILITY_ZONE) the
+// multi-shard path reads, and
+// deploy/docker/docker-compose.multi-shard.yml for a worked example.
 package main
 
 import (
@@ -83,6 +98,16 @@ const (
 )
 
 func main() {
+	// SHARD_IDS opts into the multi-shard path (internal/shard.Manager,
+	// multishard.go); its absence keeps the original single-shard path
+	// below completely unmodified, so existing single-shard deployments
+	// (docker-compose.yml, Checkpoint 1) need no changes at all.
+	if os.Getenv("SHARD_IDS") != "" {
+		if err := runMultiShard(); err != nil {
+			log.Fatalf("kvnode: %v", err)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		log.Fatalf("kvnode: %v", err)
 	}
