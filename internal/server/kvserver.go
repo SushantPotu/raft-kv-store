@@ -3,15 +3,24 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync/atomic"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/SushantPotu/raft-kv-store/internal/statemachine"
 	"github.com/SushantPotu/raft-kv-store/pkg/kvpb"
 	"github.com/SushantPotu/raft-kv-store/pkg/raft"
 )
+
+// localReader is satisfied by both fakeStateMachine (Workstream C's testing
+// fake) and internal/statemachine.Adapter (the real one), so KVServer can be
+// wired against either without caring which.
+type localReader interface {
+	Get(key []byte) (value []byte, found bool)
+}
 
 // KVServer implements kvpb.KVServiceServer, the client-facing KV gRPC
 // API. It translates each RPC into a call against a raft.Node: writes go
@@ -30,7 +39,7 @@ type KVServer struct {
 	kvpb.UnimplementedKVServiceServer
 
 	node raft.Node
-	sm   *fakeStateMachine
+	sm   localReader
 
 	reqSeq atomic.Uint64
 }
@@ -41,7 +50,7 @@ type KVServer struct {
 // store instead of NewSingleNodeStub/newFakeStateMachine (see
 // NewSingleNodeStubServer below for the all-in-one constructor
 // Workstream C's own tests use).
-func NewKVServer(node raft.Node, sm *fakeStateMachine) *KVServer {
+func NewKVServer(node raft.Node, sm localReader) *KVServer {
 	return &KVServer{node: node, sm: sm}
 }
 
@@ -65,7 +74,7 @@ var _ kvpb.KVServiceServer = (*KVServer)(nil)
 // package-local escape hatch that only exists because of the parallel
 // Raft Core workstream not having landed yet.
 type syncApplier interface {
-	takeResult(requestID string) (commandResult, bool)
+	takeResult(requestID string) (statemachine.CommandResult, bool)
 }
 
 // leaderHint returns the empty string when node believes itself to be the
@@ -84,12 +93,23 @@ func (s *KVServer) nextRequestID() string {
 	return fmt.Sprintf("req-%d", s.reqSeq.Add(1))
 }
 
-func (s *KVServer) propose(ctx context.Context, cmd command) error {
+// propose encodes cmd and calls Node.Propose. On any failure OTHER than
+// "this replica isn't the leader," it returns an already gRPC-status-wrapped
+// error. A not-leader rejection is returned unwrapped (satisfying
+// errors.Is(err, raft.ErrNotLeader)) precisely so Put/Delete/CompareAndSwap
+// can tell the two cases apart: not-leader isn't a failure from the
+// client's point of view, it's a normal response carrying a LeaderHint to
+// redirect to (see leaderHint and each handler below) — kvctl already
+// expects exactly that shape.
+func (s *KVServer) propose(ctx context.Context, cmd statemachine.Command) error {
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return status.Errorf(codes.Internal, "encode command: %v", err)
 	}
 	if err := s.node.Propose(ctx, data); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			return err
+		}
 		return status.Errorf(codes.Unavailable, "propose: %v", err)
 	}
 	return nil
@@ -129,13 +149,13 @@ func (s *KVServer) Get(ctx context.Context, req *kvpb.GetRequest) (*kvpb.GetResp
 
 // Put implements kvpb.KVServiceServer.
 func (s *KVServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResponse, error) {
-	cmd := command{
+	cmd := statemachine.Command{
 		RequestID: s.nextRequestID(),
-		Op:        opPut,
+		Op:        statemachine.OpPut,
 		Key:       req.GetKey(),
 		Value:     req.GetValue(),
 	}
-	if err := s.propose(ctx, cmd); err != nil {
+	if err := s.propose(ctx, cmd); err != nil && !errors.Is(err, raft.ErrNotLeader) {
 		return nil, err
 	}
 	return &kvpb.PutResponse{LeaderHint: leaderHint(s.node)}, nil
@@ -143,12 +163,12 @@ func (s *KVServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResp
 
 // Delete implements kvpb.KVServiceServer.
 func (s *KVServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.DeleteResponse, error) {
-	cmd := command{
+	cmd := statemachine.Command{
 		RequestID: s.nextRequestID(),
-		Op:        opDel,
+		Op:        statemachine.OpDel,
 		Key:       req.GetKey(),
 	}
-	if err := s.propose(ctx, cmd); err != nil {
+	if err := s.propose(ctx, cmd); err != nil && !errors.Is(err, raft.ErrNotLeader) {
 		return nil, err
 	}
 	return &kvpb.DeleteResponse{LeaderHint: leaderHint(s.node)}, nil
@@ -157,15 +177,19 @@ func (s *KVServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.D
 // CompareAndSwap implements kvpb.KVServiceServer.
 func (s *KVServer) CompareAndSwap(ctx context.Context, req *kvpb.CompareAndSwapRequest) (*kvpb.CompareAndSwapResponse, error) {
 	requestID := s.nextRequestID()
-	cmd := command{
+	cmd := statemachine.Command{
 		RequestID:     requestID,
-		Op:            opCAS,
+		Op:            statemachine.OpCAS,
 		Key:           req.GetKey(),
 		Value:         req.GetNewValue(),
 		ExpectedValue: req.GetExpectedValue(),
 		ExpectAbsent:  req.GetExpectAbsent(),
 	}
 	if err := s.propose(ctx, cmd); err != nil {
+		if errors.Is(err, raft.ErrNotLeader) {
+			// Never proposed anywhere — no result to retrieve, just redirect.
+			return &kvpb.CompareAndSwapResponse{LeaderHint: leaderHint(s.node)}, nil
+		}
 		return nil, err
 	}
 
