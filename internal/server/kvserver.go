@@ -81,12 +81,36 @@ type syncApplier interface {
 // leader (always true for SingleNodeStub), and the known leader's ID
 // otherwise. This plumbing matters once a real multi-node Node exists;
 // for the stub it is always "".
+//
+// Ambiguity callers must handle: "" is also what this returns when node
+// is a follower that doesn't know who the leader is yet (st.Leader == "",
+// e.g. mid-election) — indistinguishable at this layer from "I am the
+// leader." notLeaderResponse below is what turns that ambiguity back into
+// a real error instead of a response a client would misread as success.
 func leaderHint(node raft.Node) string {
 	st := node.Status()
 	if st.IsLeader {
 		return ""
 	}
 	return string(st.Leader)
+}
+
+// notLeaderResponse computes what a write handler should return after
+// propose returned raft.ErrNotLeader. Normally that's not a client-visible
+// failure — just a redirect via LeaderHint (see propose's doc comment).
+// But if this replica doesn't know who the leader is either, leaderHint
+// returns "" — the same value it returns when this replica *is* the
+// leader (see that function's doc comment) — so returning a normal
+// response with an empty LeaderHint here would be silently
+// indistinguishable from success: the write was never proposed anywhere,
+// yet a client checking only "was LeaderHint set" would conclude it
+// succeeded. Surface that case as a real error instead.
+func (s *KVServer) notLeaderResponse() (hint string, err error) {
+	hint = leaderHint(s.node)
+	if hint == "" {
+		return "", status.Error(codes.Unavailable, "not leader, and no leader is currently known")
+	}
+	return hint, nil
 }
 
 func (s *KVServer) nextRequestID() string {
@@ -155,8 +179,15 @@ func (s *KVServer) Put(ctx context.Context, req *kvpb.PutRequest) (*kvpb.PutResp
 		Key:       req.GetKey(),
 		Value:     req.GetValue(),
 	}
-	if err := s.propose(ctx, cmd); err != nil && !errors.Is(err, raft.ErrNotLeader) {
-		return nil, err
+	if err := s.propose(ctx, cmd); err != nil {
+		if !errors.Is(err, raft.ErrNotLeader) {
+			return nil, err
+		}
+		hint, uerr := s.notLeaderResponse()
+		if uerr != nil {
+			return nil, uerr
+		}
+		return &kvpb.PutResponse{LeaderHint: hint}, nil
 	}
 	return &kvpb.PutResponse{LeaderHint: leaderHint(s.node)}, nil
 }
@@ -168,8 +199,15 @@ func (s *KVServer) Delete(ctx context.Context, req *kvpb.DeleteRequest) (*kvpb.D
 		Op:        statemachine.OpDel,
 		Key:       req.GetKey(),
 	}
-	if err := s.propose(ctx, cmd); err != nil && !errors.Is(err, raft.ErrNotLeader) {
-		return nil, err
+	if err := s.propose(ctx, cmd); err != nil {
+		if !errors.Is(err, raft.ErrNotLeader) {
+			return nil, err
+		}
+		hint, uerr := s.notLeaderResponse()
+		if uerr != nil {
+			return nil, uerr
+		}
+		return &kvpb.DeleteResponse{LeaderHint: hint}, nil
 	}
 	return &kvpb.DeleteResponse{LeaderHint: leaderHint(s.node)}, nil
 }
@@ -187,8 +225,14 @@ func (s *KVServer) CompareAndSwap(ctx context.Context, req *kvpb.CompareAndSwapR
 	}
 	if err := s.propose(ctx, cmd); err != nil {
 		if errors.Is(err, raft.ErrNotLeader) {
-			// Never proposed anywhere — no result to retrieve, just redirect.
-			return &kvpb.CompareAndSwapResponse{LeaderHint: leaderHint(s.node)}, nil
+			// Never proposed anywhere — no result to retrieve, just redirect
+			// (or a real error if even the leader's identity is unknown —
+			// see notLeaderResponse).
+			hint, uerr := s.notLeaderResponse()
+			if uerr != nil {
+				return nil, uerr
+			}
+			return &kvpb.CompareAndSwapResponse{LeaderHint: hint}, nil
 		}
 		return nil, err
 	}

@@ -180,3 +180,32 @@ func TestKVServerNotLeaderReturnsHintNotError(t *testing.T) {
 		t.Fatal("CompareAndSwap on a non-leader must not report swapped=true — nothing was ever proposed")
 	}
 }
+
+// TestKVServerNotLeaderAndLeaderUnknownReturnsError covers the case
+// notLeaderNode{leader: "kvnode-2"} above can't: a follower that doesn't
+// know who the leader is either (e.g. mid-election), so its
+// leader_hint would be "" — the same value a *successful* write from
+// the actual leader also produces (see leaderHint's doc comment). Without
+// notLeaderResponse's explicit check, Put/Delete/CompareAndSwap would
+// return that empty-hint response as if the write had succeeded, when it
+// was never proposed anywhere. This is exactly the bug that made
+// internal/localcluster's very first end-to-end test flake: a client
+// racing the cluster's initial election could get a false "OK" for a
+// write that silently vanished.
+func TestKVServerNotLeaderAndLeaderUnknownReturnsError(t *testing.T) {
+	node := &notLeaderNode{leader: ""}
+	s := NewKVServer(node, newFakeStateMachine())
+
+	if _, err := s.Put(context.Background(), &kvpb.PutRequest{Key: []byte("k"), Value: []byte("v")}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("Put with leader unknown: err = %v, want codes.Unavailable", err)
+	}
+	if _, err := s.Delete(context.Background(), &kvpb.DeleteRequest{Key: []byte("k")}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("Delete with leader unknown: err = %v, want codes.Unavailable", err)
+	}
+	_, err := s.CompareAndSwap(context.Background(), &kvpb.CompareAndSwapRequest{
+		Key: []byte("k"), ExpectAbsent: true, NewValue: []byte("v"),
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("CompareAndSwap with leader unknown: err = %v, want codes.Unavailable", err)
+	}
+}
