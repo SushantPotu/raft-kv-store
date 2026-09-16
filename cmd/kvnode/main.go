@@ -173,7 +173,10 @@ func run() error {
 	var wg sync.WaitGroup
 
 	// Peer-facing RaftTransportService.
-	peerSrv := grpc.NewServer()
+	peerSrv := grpc.NewServer(
+		grpc.MaxRecvMsgSize(grpctransport.MaxMessageSize),
+		grpc.MaxSendMsgSize(grpctransport.MaxMessageSize),
+	)
 	raftpb.RegisterRaftTransportServiceServer(peerSrv, grpctransport.NewServer(registry))
 	peerLis, err := net.Listen("tcp", peerListenAddr)
 	if err != nil {
@@ -289,7 +292,7 @@ func handleReady(ctx context.Context, rd raft.Ready, storage raft.Storage, adapt
 		go func() {
 			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := transport.Send(sendCtx, msg); err != nil {
+			if err := raft.SendMessage(sendCtx, transport, msg); err != nil {
 				log.Printf("kvnode: Send to %s failed: %v", msg.To, err)
 			}
 		}()

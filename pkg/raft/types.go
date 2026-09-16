@@ -161,6 +161,29 @@ type Transport interface {
 	SendInstallSnapshotChunk(ctx context.Context, shard ShardID, target NodeID, chunk *raftpb.InstallSnapshotChunk) error
 }
 
+// SendMessage dispatches msg to t via whichever of Transport's two methods
+// msg's payload actually requires: SendInstallSnapshotChunk for a
+// *raftpb.InstallSnapshotChunk payload (the streaming binding a snapshot
+// chunk needs — see Transport's doc comment on why that's a separate
+// method), Send for everything else.
+//
+// Every Ready-loop driver should route every message in Ready.Messages
+// through this rather than calling t.Send directly: Node.Ready has no way
+// to mark which of its Messages need the chunk-specific transport
+// binding, so a driver that calls Send unconditionally will silently fail
+// to deliver every InstallSnapshotChunk raftcore's snapshot.go ever
+// queues (Transport.Send's own implementations reject that payload type
+// outright, by design — see internal/transport/grpc.Client.Send). Both
+// existing drivers (cmd/kvnode, internal/shard.Manager) had exactly this
+// bug independently before this helper existed to fix it once instead of
+// twice.
+func SendMessage(ctx context.Context, t Transport, msg Message) error {
+	if chunk, ok := msg.Payload.(*raftpb.InstallSnapshotChunk); ok {
+		return t.SendInstallSnapshotChunk(ctx, msg.Shard, msg.To, chunk)
+	}
+	return t.Send(ctx, msg)
+}
+
 // Status is a read-only snapshot of a Node's current view of the world,
 // used for observability (CloudWatch metrics, kvctl status, tests).
 type Status struct {
@@ -184,21 +207,21 @@ type Status struct {
 // which is what makes the deterministic simulation harness
 // (internal/raft/simulate) possible.
 type Ready struct {
-	HardState       *HardState // nil if unchanged
-	Entries         []LogEntry // newly appended, must be persisted before sending Messages
+	HardState        *HardState // nil if unchanged
+	Entries          []LogEntry // newly appended, must be persisted before sending Messages
 	CommittedEntries []LogEntry
-	Messages        []Message
-	Snapshot        *Snapshot
+	Messages         []Message
+	Snapshot         *Snapshot
 }
 
 // Message is Node's internal representation of an outbound RPC, translated
 // to a concrete raftpb request by internal/shard.Manager before handing it
 // to Transport.
 type Message struct {
-	To      NodeID
-	Shard   ShardID
-	Kind    MessageKind
-	Term    Term
+	To    NodeID
+	Shard ShardID
+	Kind  MessageKind
+	Term  Term
 	// Payload is one of *raftpb.RequestVoteRequest, *raftpb.AppendEntriesRequest,
 	// *raftpb.InstallSnapshotRequest — OR the corresponding *Response type.
 	// Both requests and responses flow through this same Message/Step

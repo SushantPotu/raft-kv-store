@@ -345,7 +345,7 @@ func (m *Manager) handleReady(hs *hostedShard, rd raft.Ready) {
 		go func() {
 			sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := m.transport.Send(sendCtx, msg); err != nil {
+			if err := raft.SendMessage(sendCtx, m.transport, msg); err != nil {
 				log.Printf("shard.Manager: shard %s: Send to %s failed: %v", hs.ID, msg.To, err)
 			}
 		}()
