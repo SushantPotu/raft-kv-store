@@ -20,7 +20,7 @@ type steppingNode struct {
 
 var _ raft.Node = (*steppingNode)(nil)
 
-func (n *steppingNode) Propose(ctx context.Context, data []byte) error                 { return nil }
+func (n *steppingNode) Propose(ctx context.Context, data []byte) error                  { return nil }
 func (n *steppingNode) ProposeConfChange(ctx context.Context, cc raft.ConfChange) error { return nil }
 func (n *steppingNode) ReadIndex(ctx context.Context, ctxToken []byte) error            { return nil }
 func (n *steppingNode) Step(ctx context.Context, msg raft.InboundMessage) error {
