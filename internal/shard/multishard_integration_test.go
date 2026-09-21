@@ -32,8 +32,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	raftcore "github.com/SushantPotu/raft-kv-store/internal/raft"
 	"github.com/SushantPotu/raft-kv-store/internal/metaservice"
+	raftcore "github.com/SushantPotu/raft-kv-store/internal/raft"
 	"github.com/SushantPotu/raft-kv-store/internal/routing"
 	"github.com/SushantPotu/raft-kv-store/internal/shard"
 	"github.com/SushantPotu/raft-kv-store/internal/statemachine"

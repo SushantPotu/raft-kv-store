@@ -52,31 +52,14 @@ deployment) exists and is `terraform validate`-clean, but actually
 deploying it is a deliberate, out-of-scope decision for this project (no
 AWS account backs it) — see [Infrastructure-as-code, not deployed](#infrastructure-as-code-not-deployed).
 
-## What's implemented today
-
-| Layer | Status | Where |
-|---|---|---|
-| Leader election | ✅ Done, fuzz-tested | `internal/raft` |
-| Log replication (nextIndex/matchIndex, conflict backtracking) | ✅ Done, fuzz-tested | `internal/raft` |
-| Commit-safety rule (§5.4.2) | ✅ Done, fuzz-tested | `internal/raft` |
-| Log compaction / snapshotting | ✅ Done | `internal/raft/snapshot.go` |
-| Linearizable reads (ReadIndex, §8) | ✅ Done | `internal/raft/readindex.go` |
-| Dynamic membership changes (joint consensus, §6) | ✅ Done, fuzzed | `internal/raft/membership.go` |
-| Crash-recoverable KV storage engine (WAL + compaction) | ✅ Done | `internal/storage/wal`, `internal/storage/engine` |
-| Durable Raft log with conflicting-tail truncation | ✅ Done | `internal/storage/raftlog` |
-| gRPC transport (peer-to-peer + client-facing) | ✅ Done | `internal/transport/grpc`, `internal/server` |
-| Real single-shard node binary (`kvnode`) | ✅ Done | `cmd/kvnode` |
-| Multi-Raft sharding (N shards per process) | ✅ Done | `internal/shard` |
-| Shard-aware routing + metadata service | ✅ Done | `internal/routing`, `internal/metaservice`, `cmd/kvrouter`, `cmd/metaservice` |
-| `kvctl` CLI | ✅ Done | `cmd/kvctl` |
-| Real (non-Docker) multi-node test harness | ✅ Done | `internal/localcluster` |
-| Chaos testing with real measured failover time | ✅ Done — see numbers below | `internal/chaos`, `cmd/chaosmonkey` |
-| Load testing with real measured throughput/latency | ✅ Done — see numbers below | `internal/loadgen`, `cmd/loadgen` |
-| AWS infrastructure-as-code (VPC, ECS Fargate, DynamoDB, Cloud Map, ALB, IAM, CloudWatch) | ✅ Written, `terraform validate`-clean, **intentionally not applied** | `deploy/terraform` |
-| Real AWS deployment | ⛔ Out of scope by choice — no AWS account backs this project | — |
-
 ~15,100 lines of hand-written Go (excluding generated protobuf code), 107
-tests, across 12 commits.
+tests, across 13 commits — leader election, log replication, log
+compaction, linearizable reads, and joint-consensus membership are all
+implemented and fuzz-tested; multi-shard sharding, routing, and the
+metadata service are implemented, not scaffolded; chaos and load testing
+produced the real numbers below. AWS infrastructure-as-code is written
+and `terraform validate`-clean but intentionally never applied — see
+[Infrastructure-as-code, not deployed](#infrastructure-as-code-not-deployed).
 
 ## Architecture
 
